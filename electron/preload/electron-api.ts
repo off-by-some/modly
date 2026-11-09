@@ -291,12 +291,14 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         percent?: number
         extensionId?: string
         message?: string
+        details?: string
       }) => void) => {
         ipcRenderer.on('extensions:installProgress', (_event, data) => cb(data as {
           step: 'downloading' | 'extracting' | 'validating' | 'setting_up' | 'done' | 'error'
           percent?: number
           extensionId?: string
           message?: string
+          details?: string
         }))
       },
       offInstallProgress: () => ipcRenderer.removeAllListeners('extensions:installProgress'),

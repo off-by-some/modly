@@ -35,6 +35,7 @@ export default function ModelsPage(): JSX.Element {
   const extLoading        = useExtensionsStore((s) => s.loading)
   const installProgress   = useExtensionsStore((s) => s.installProgress)
   const installError      = useExtensionsStore((s) => s.installError)
+  const installLogs       = useExtensionsStore((s) => s.installLogs)
   const loadErrors        = useExtensionsStore((s) => s.loadErrors)
   const loadExtensions    = useExtensionsStore((s) => s.loadExtensions)
   const installFromGH     = useExtensionsStore((s) => s.installFromGitHub)
@@ -66,6 +67,7 @@ export default function ModelsPage(): JSX.Element {
   const [sortOpen, setSortOpen]   = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const searchRef = useRef<HTMLInputElement>(null)
+  const installLogRef = useRef<HTMLPreElement>(null)
 
   // Another page asked to open an extension (e.g. a weight variant picked but not installed)
   const extensionToOpen      = useNavStore((s) => s.extensionToOpen)
@@ -168,6 +170,11 @@ export default function ModelsPage(): JSX.Element {
   useEffect(() => {
     if (installError) setGhErr(installError)
   }, [installError])
+
+  useEffect(() => {
+    const log = installLogRef.current
+    if (log) log.scrollTop = log.scrollHeight
+  }, [installLogs.length])
 
   // "/" focuses the search field
   useEffect(() => {
@@ -588,11 +595,31 @@ export default function ModelsPage(): JSX.Element {
             )}
 
             {ghErr && (
-              <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-950/30 border border-red-800/30">
+              <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-red-950/30 border border-red-800/30">
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-red-400 shrink-0">
                   <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
                 </svg>
-                <p className="text-[11px] text-red-400">{ghErr}</p>
+                <p className="text-[11px] text-red-400 break-words min-w-0">{ghErr.split(/\r?\n/, 1)[0]}</p>
+              </div>
+            )}
+
+            {installLogs.length > 0 && (
+              <div className="overflow-hidden rounded-lg bg-black/35 border border-zinc-700/50">
+                <div className="flex items-center justify-between gap-3 px-3 py-1.5 border-b border-zinc-800/80 bg-zinc-950/40">
+                  <span className="text-[9px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                    Installation log
+                  </span>
+                  <span className={`text-[9px] ${isInstalling ? 'text-accent-light' : installProgress?.step === 'error' ? 'text-red-400' : 'text-zinc-600'}`}>
+                    {isInstalling ? 'Live' : installProgress?.step === 'error' ? 'Failed' : `${installLogs.length} lines`}
+                  </span>
+                </div>
+                <pre
+                  ref={installLogRef}
+                  aria-live="polite"
+                  className="max-h-52 overflow-auto whitespace-pre-wrap break-words px-3 py-2.5 font-mono text-[10px] leading-[1.55] text-zinc-400 select-text"
+                >
+                  {installLogs.join('\n')}
+                </pre>
               </div>
             )}
 

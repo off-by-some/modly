@@ -1812,6 +1812,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const win    = getWindow()
     const emit   = (data: object) => win?.webContents.send('extensions:installProgress', data)
     if (isRemoteBackend()) {
+      let serverError: { message: string; details?: string } | null = null
       try {
         const response = await axios.post<NodeJS.ReadableStream>(
           `${selectedApiUrl()}/extensions/install-github`,
@@ -1824,7 +1825,6 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         )
         let buffer = ''
         let result: Record<string, unknown> | null = null
-        let serverError = ''
         const consumeEvent = (block: string) => {
           const payload = block
             .split('\n')
@@ -1834,8 +1834,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
           if (!payload) return
           const event = JSON.parse(payload) as Record<string, unknown>
           if (event.step === 'result') result = event
-          else if (event.step === 'error') serverError = String(event.message ?? 'Extension installation failed')
-          else emit(event)
+          else {
+            if (event.step === 'error') {
+              serverError = {
+                message: String(event.message ?? 'Extension installation failed'),
+                details: typeof event.details === 'string' ? event.details : undefined,
+              }
+            }
+            emit(event)
+          }
         }
         for await (const chunk of response.data) {
           buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk)
@@ -1844,13 +1851,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
           for (const block of blocks) consumeEvent(block)
         }
         if (buffer.trim()) consumeEvent(buffer)
-        if (serverError) throw new Error(serverError)
+        if (serverError) throw new Error(serverError.message)
         if (!result || result.success !== true) throw new Error('The server ended the install without a result')
         emit({ step: 'done', extensionId: result.extensionId })
         return result
       } catch (err) {
-        const error = axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err)
-        emit({ step: 'error', message: error })
+        const error = serverError?.message ?? (
+          axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err)
+        )
+        if (!serverError) emit({ step: 'error', message: error })
         return { success: false, error }
       }
     }

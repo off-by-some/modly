@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -13,6 +14,8 @@ import services.generator_registry as registry_module
 from routers.extensions import reload_extensions
 from services.builtin_extensions import BUILTIN_MARKER, sync_builtin_extensions
 from services.extension_installer import (
+    InstallCommandError,
+    _run_command,
     extract_archive,
     parse_github_repository,
     recover_interrupted_installs,
@@ -73,6 +76,27 @@ class ExtensionReloadRouteTests(unittest.TestCase):
 
 
 class ServerExtensionInstallerTests(unittest.TestCase):
+    def test_failed_setup_streams_output_and_preserves_traceback_details(self) -> None:
+        events: list[dict] = []
+
+        async def progress(event: dict) -> None:
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(InstallCommandError) as raised:
+                asyncio.run(_run_command(
+                    [sys.executable, "-c", "print('installing dependency', flush=True); raise RuntimeError('setup exploded')"],
+                    Path(tmp),
+                    progress,
+                    "Setting up Python environment",
+                ))
+
+        self.assertEqual(str(raised.exception), "Setting up Python environment failed (exit 1)")
+        self.assertIn("installing dependency", raised.exception.details)
+        self.assertIn("Traceback (most recent call last):", raised.exception.details)
+        self.assertIn("RuntimeError: setup exploded", raised.exception.details)
+        self.assertTrue(any(event.get("message") == "installing dependency" for event in events))
+
     def test_only_canonical_github_repository_urls_are_accepted(self) -> None:
         self.assertEqual(
             parse_github_repository("https://github.com/acme/example.git"),

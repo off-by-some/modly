@@ -357,6 +357,7 @@ declare global {
           percent?:      number
           extensionId?:  string
           message?:      string
+          details?:      string
         }) => void) => void
         offInstallProgress: () => void
       }

@@ -13,6 +13,7 @@ export interface InstallProgress {
   percent?:     number
   extensionId?: string
   message?:     string
+  details?:     string
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -23,6 +24,7 @@ interface ExtensionsStore {
   loading:           boolean
   installProgress:   InstallProgress | null
   installError:      string | null
+  installLogs:       string[]
   loadErrors:        Record<string, string>
   /** Installed weight variant ids, keyed by "ext_id/node_id", for nodes that declare variants */
   installedWeightVariants: Record<string, string[]>
@@ -56,6 +58,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   loading:           false,
   installProgress:   null,
   installError:      null,
+  installLogs:       [],
   loadErrors:        {},
   installedWeightVariants: {},
 
@@ -106,7 +109,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
     const result = await installExtension(() => window.electron.extensions.installFromLocal(), set)
     // If user cancelled the folder picker, treat as a no-op (not an error)
     if ((result as any).cancelled) {
-      set({ installProgress: null, installError: null })
+      set({ installProgress: null, installError: null, installLogs: [] })
       return { success: false, cancelled: true }
     }
     return result
@@ -138,7 +141,7 @@ export const useExtensionsStore = create<ExtensionsStore>((set, get) => ({
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   clearInstallState() {
-    set({ installProgress: null, installError: null })
+    set({ installProgress: null, installError: null, installLogs: [] })
   },
 }))
 
@@ -152,13 +155,20 @@ async function installExtension(
   }>,
   set: (partial: Partial<ExtensionsStore> | ((state: ExtensionsStore) => Partial<ExtensionsStore>)) => void,
 ) {
-    set({ installProgress: { step: 'downloading', percent: 0 }, installError: null })
+    set({ installProgress: { step: 'downloading', percent: 0 }, installError: null, installLogs: [] })
 
     window.electron.extensions.onInstallProgress((data) => {
       if (data.step === 'error') {
-        set({ installProgress: null, installError: data.message ?? 'Unknown error' })
+        set((state) => ({
+          installProgress: data as InstallProgress,
+          installError: data.message ?? 'Unknown error',
+          installLogs: appendInstallLog(state.installLogs, data.details ?? data.message),
+        }))
       } else {
-        set({ installProgress: data as InstallProgress })
+        set((state) => ({
+          installProgress: data as InstallProgress,
+          installLogs: appendInstallLog(state.installLogs, data.message),
+        }))
       }
     })
 
@@ -197,19 +207,57 @@ async function installExtension(
             ? [...state.processExtensions.filter((entry) => entry.id !== ext.id), ext]
             : state.processExtensions.filter((entry) => entry.id !== ext.id),
           loadErrors: { ...state.loadErrors, [ext.id]: error },
-          installProgress: null,
+          installProgress: { step: 'error', message: error },
           installError: error,
         }))
       } else {
-        set({ installProgress: null, installError: result.error ?? 'Installation failed' })
+        const error = result.error ?? 'Installation failed'
+        set((state) => ({
+          installProgress: state.installProgress?.step === 'error'
+            ? state.installProgress
+            : { step: 'error', message: error },
+          installError: error,
+          installLogs: state.installLogs.length > 0
+            ? state.installLogs
+            : appendInstallLog(state.installLogs, error),
+        }))
       }
 
       return result
     } catch (err) {
       const error = String(err)
-      set({ installProgress: null, installError: error })
+      set((state) => ({
+        installProgress: { step: 'error', message: error },
+        installError: error,
+        installLogs: appendInstallLog(state.installLogs, error),
+      }))
       return { success: false, error }
     } finally {
       window.electron.extensions.offInstallProgress()
     }
+}
+
+const MAX_INSTALL_LOG_LINES = 500
+
+function appendInstallLog(current: string[], text?: string): string[] {
+  if (!text) return current
+  const incoming = text
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd().slice(-4000))
+    .filter(Boolean)
+  if (incoming.length === 0) return current
+
+  // Terminal errors include subprocess output again so a dropped live event
+  // cannot hide the useful part. Find that replay within the terminal payload
+  // and append only lines the live stream did not already deliver.
+  for (let overlap = Math.min(current.length, incoming.length); overlap > 0; overlap -= 1) {
+    const existingTail = current.slice(current.length - overlap)
+    for (let start = 0; start <= incoming.length - overlap; start += 1) {
+      const replay = incoming.slice(start, start + overlap)
+      if (existingTail.every((line, index) => line === replay[index])) {
+        return [...current, ...incoming.slice(start + overlap)].slice(-MAX_INSTALL_LOG_LINES)
+      }
+    }
+  }
+  return [...current, ...incoming].slice(-MAX_INSTALL_LOG_LINES)
 }

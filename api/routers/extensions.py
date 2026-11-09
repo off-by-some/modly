@@ -6,6 +6,8 @@ import re
 import subprocess
 import sys
 import shutil
+import logging
+import traceback
 from pathlib import Path
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import StreamingResponse
@@ -13,6 +15,7 @@ from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["extensions"])
 _install_tasks: set[asyncio.Task] = set()
+_install_logger = logging.getLogger("modly.extensions.install")
 
 _SAFE_EXTENSION_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -227,7 +230,9 @@ async def install_from_github(body: GitHubInstall):
                     "extension": _manifest_for_client(result["manifest"]),
                 })
             except Exception as exc:
-                await emit({"step": "error", "message": str(exc)})
+                _install_logger.exception("Extension installation failed")
+                details = getattr(exc, "details", "") or traceback.format_exc()
+                await emit({"step": "error", "message": str(exc), "details": details})
             finally:
                 if connected:
                     if queue.full():
@@ -239,7 +244,13 @@ async def install_from_github(body: GitHubInstall):
         task.add_done_callback(_install_tasks.discard)
         try:
             while True:
-                event = await queue.get()
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                except TimeoutError:
+                    # Keep reverse proxies from buffering or retiring an idle
+                    # install while a setup command is temporarily silent.
+                    yield ": keep-alive\n\n"
+                    continue
                 if event is None:
                     break
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -248,7 +259,14 @@ async def install_from_github(body: GitHubInstall):
             # the progress stream. Startup recovery covers a server shutdown.
             connected = False
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.delete("/{extension_id}")

@@ -47,3 +47,46 @@ test('extension list keeps an interrupted model in the model store with recovery
   assert.deepEqual(result.modelExtensions, [pendingModel])
   assert.deepEqual(result.processExtensions, [processExtension])
 })
+
+test('failed extension setup retains live output and terminal traceback', async () => {
+  let progress
+  globalThis.window = {
+    electron: {
+      extensions: {
+        onInstallProgress(callback) {
+          progress = callback
+        },
+        offInstallProgress() {},
+        async installFromGitHub() {
+          progress({ step: 'setting_up', message: 'Setting up Python environment' })
+          progress({ step: 'setting_up', message: 'installing dependency' })
+          progress({
+            step: 'error',
+            message: 'Setting up Python environment failed (exit 1)',
+            details: 'installing dependency\nTraceback (most recent call last):\n  File "setup.py", line 1\nRuntimeError: setup exploded',
+          })
+          return { success: false, error: 'Setting up Python environment failed (exit 1)' }
+        },
+      },
+    },
+  }
+
+  try {
+    const { useExtensionsStore } = loadModule()
+    const result = await useExtensionsStore.getState().installFromGitHub('https://github.com/acme/example')
+    const state = useExtensionsStore.getState()
+
+    assert.equal(result.success, false)
+    assert.equal(state.installProgress.step, 'error')
+    assert.equal(state.installError, 'Setting up Python environment failed (exit 1)')
+    assert.deepEqual(state.installLogs, [
+      'Setting up Python environment',
+      'installing dependency',
+      'Traceback (most recent call last):',
+      '  File "setup.py", line 1',
+      'RuntimeError: setup exploded',
+    ])
+  } finally {
+    delete globalThis.window
+  }
+})

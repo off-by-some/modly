@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -11,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
@@ -30,6 +32,14 @@ _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _install_lock = asyncio.Lock()
 
 Progress = Callable[[dict], Awaitable[None]]
+_logger = logging.getLogger("modly.extensions.install")
+_logger.setLevel(logging.INFO)
+
+
+class InstallCommandError(RuntimeError):
+    def __init__(self, summary: str, details: str):
+        super().__init__(summary)
+        self.details = details
 
 
 def parse_github_repository(value: str) -> tuple[str, str, str]:
@@ -153,6 +163,7 @@ def validate_manifest(extension_dir: Path) -> tuple[dict, str, bool, bool]:
 
 async def _run_command(command: list[str], cwd: Path, progress: Progress, message: str) -> None:
     await progress({"step": "setting_up", "message": message})
+    _logger.info("%s: %s", message, " ".join(command))
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(cwd),
@@ -161,12 +172,15 @@ async def _run_command(command: list[str], cwd: Path, progress: Progress, messag
         env={**os.environ, "PYTHONUTF8": "1"},
     )
     assert process.stdout is not None
+    output_lines: deque[str] = deque(maxlen=500)
 
     async def consume() -> None:
         while line := await process.stdout.readline():
-            text = line.decode("utf-8", errors="replace").strip()
-            if text:
-                await progress({"step": "setting_up", "message": text[-1000:]})
+            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if text.strip():
+                output_lines.append(text[:4000])
+                _logger.info("%s", text)
+                await progress({"step": "setting_up", "message": text[:1000]})
 
     try:
         await asyncio.wait_for(consume(), timeout=SETUP_TIMEOUT_SECONDS)
@@ -174,9 +188,15 @@ async def _run_command(command: list[str], cwd: Path, progress: Progress, messag
     except TimeoutError:
         process.kill()
         await process.wait()
-        raise RuntimeError(f"{message} timed out")
+        raise InstallCommandError(
+            f"{message} timed out",
+            "\n".join(output_lines) or "The command timed out without producing output.",
+        )
     if code != 0:
-        raise RuntimeError(f"{message} failed (exit {code})")
+        raise InstallCommandError(
+            f"{message} failed (exit {code})",
+            "\n".join(output_lines) or "The command exited without producing output.",
+        )
 
 
 async def _compile_typescript(extension_dir: Path, entry: str, progress: Progress) -> str:
