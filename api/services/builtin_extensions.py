@@ -52,7 +52,11 @@ def _build_repository_builtins(destination_root: Path) -> Path | None:
                 [
                     "npx", "--yes", "esbuild", str(typescript), "--bundle",
                     "--platform=node", "--format=cjs", f"--outfile={target / 'processor.js'}",
-                    "--external:electron",
+                    # Third-party packages are installed into this built-in's
+                    # own node_modules immediately below. Keep those imports as
+                    # runtime requires instead of asking esbuild to resolve
+                    # them from the TypeScript source directory.
+                    "--packages=external", "--external:electron",
                 ],
                 cwd=project_root,
                 check=True,

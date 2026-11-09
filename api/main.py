@@ -54,7 +54,15 @@ async def lifespan(app: FastAPI):
     if EXTENSIONS_DIR is not None:
         recover_interrupted_installs(EXTENSIONS_DIR)
         if os.environ.get("MODLY_DESKTOP_MANAGED") != "1":
-            sync_builtin_extensions(EXTENSIONS_DIR)
+            try:
+                sync_builtin_extensions(EXTENSIONS_DIR)
+            except Exception:
+                # Built-ins are conveniences, not a prerequisite for serving
+                # the API. Keep the server online and make the failure visible
+                # so a later restart can retry the atomic staging directory.
+                logging.getLogger("modly.extensions").exception(
+                    "Built-in extension bootstrap failed; continuing without refreshed built-ins."
+                )
     generator_registry.initialize()
     yield
     # Shutdown: unload all models and stop the local LLM server
