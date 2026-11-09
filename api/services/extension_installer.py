@@ -42,6 +42,31 @@ class InstallCommandError(RuntimeError):
         self.details = details
 
 
+def extension_setup_environment(
+    flavor: str,
+    torch_index_url: str = "",
+    torch_specs: list[str] | None = None,
+) -> dict[str, str]:
+    """Build the environment inherited by third-party setup.py processes.
+
+    CUDA extensions commonly make the PyTorch wheel repository pip's primary
+    index. Older ensurepip versions can reject a dependency wheel there and
+    fall back to an sdist whose build requirements only exist on PyPI. Keep
+    PyPI reachable without changing the CUDA index selected by the extension.
+    Operators can override or disable the fallback with
+    MODLY_EXTENSION_PYPI_INDEX_URL.
+    """
+    env = dict(os.environ)
+    env["MODLY_TORCH_FLAVOR"] = flavor
+    env["MODLY_TORCH_INDEX_URL"] = torch_index_url
+    env["MODLY_TORCH_SPECS"] = json.dumps(torch_specs or [])
+    if flavor == "cuda" and "PIP_EXTRA_INDEX_URL" not in env:
+        fallback = env.get("MODLY_EXTENSION_PYPI_INDEX_URL", "https://pypi.org/simple").strip()
+        if fallback:
+            env["PIP_EXTRA_INDEX_URL"] = fallback
+    return env
+
+
 def parse_github_repository(value: str) -> tuple[str, str, str]:
     parsed = urlparse(value.strip())
     parts = [part for part in parsed.path.split("/") if part]
@@ -161,7 +186,14 @@ def validate_manifest(extension_dir: Path) -> tuple[dict, str, bool, bool]:
     return manifest, entry, is_process, is_process and entry.endswith(".py")
 
 
-async def _run_command(command: list[str], cwd: Path, progress: Progress, message: str) -> None:
+async def _run_command(
+    command: list[str],
+    cwd: Path,
+    progress: Progress,
+    message: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
     await progress({"step": "setting_up", "message": message})
     _logger.info("%s: %s", message, " ".join(command))
     process = await asyncio.create_subprocess_exec(
@@ -169,7 +201,7 @@ async def _run_command(command: list[str], cwd: Path, progress: Progress, messag
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env={**os.environ, "PYTHONUTF8": "1"},
+        env={**(env or os.environ), "PYTHONUTF8": "1"},
     )
     assert process.stdout is not None
     output_lines: deque[str] = deque(maxlen=500)
@@ -228,6 +260,8 @@ async def _setup_extension(extension_dir: Path, manifest: dict, entry: str, prog
         gpu_sm, cuda_version = _detect_nvidia_gpu()
         gfx_target = "" if gpu_sm else _detect_gfx_target()
         flavor = "cuda" if gpu_sm else ("rocm" if gfx_target else "cpu")
+        torch_index_url = _rocm_index_url() if flavor == "rocm" else ""
+        torch_specs = ["torch", "torchvision"] if flavor == "rocm" else []
         args = json.dumps({
             "python_exe": sys.executable,
             "ext_dir": str(extension_dir),
@@ -236,11 +270,17 @@ async def _setup_extension(extension_dir: Path, manifest: dict, entry: str, prog
             "accelerator": flavor,
             "torch_flavor": flavor,
             "gfx_target": gfx_target,
-            "torch_index_url": _rocm_index_url() if flavor == "rocm" else "",
+            "torch_index_url": torch_index_url,
             "platform": sys.platform,
             "arch": _node_arch(),
         })
-        await _run_command([sys.executable, str(setup_py), args], extension_dir, progress, "Setting up Python environment")
+        await _run_command(
+            [sys.executable, str(setup_py), args],
+            extension_dir,
+            progress,
+            "Setting up Python environment",
+            env=extension_setup_environment(flavor, torch_index_url, torch_specs),
+        )
     elif is_process and (extension_dir / "package.json").is_file():
         npm = "npm.cmd" if sys.platform == "win32" else "npm"
         await _run_command(

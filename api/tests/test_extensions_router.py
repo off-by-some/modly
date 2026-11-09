@@ -11,11 +11,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 import services.generator_registry as registry_module
-from routers.extensions import reload_extensions
+from routers.extensions import (
+    GitHubInstall,
+    _install_jobs,
+    install_from_github,
+    install_github_status,
+    reload_extensions,
+)
 from services.builtin_extensions import BUILTIN_MARKER, sync_builtin_extensions
 from services.extension_installer import (
     InstallCommandError,
     _run_command,
+    extension_setup_environment,
     extract_archive,
     parse_github_repository,
     recover_interrupted_installs,
@@ -75,7 +82,82 @@ class ExtensionReloadRouteTests(unittest.TestCase):
         self.assertEqual(self.registry.reload_calls, [capability])
 
 
+class ExtensionInstallStatusTests(unittest.TestCase):
+    def test_install_continues_after_the_progress_stream_disconnects(self) -> None:
+        async def fake_install(_url: str, _root: Path, progress) -> dict:
+            await progress({"step": "setting_up", "message": "Downloading a large wheel"})
+            await asyncio.sleep(0.01)
+            return {
+                "success": True,
+                "extensionId": "example",
+                "manifest": {
+                    "id": "example",
+                    "type": "model",
+                    "generator_class": "Example",
+                    "nodes": [{"id": "generate"}],
+                },
+            }
+
+        async def scenario(root: Path) -> dict:
+            with patch("services.extension_installer.install_github", new=fake_install):
+                response = await install_from_github(GitHubInstall(url="https://github.com/acme/example"))
+                install_id = response.headers["x-modly-install-id"]
+                stream = response.body_iterator
+                await anext(stream)
+                await stream.aclose()
+                for _ in range(50):
+                    status = await install_github_status(install_id)
+                    if status["done"]:
+                        _install_jobs.pop(install_id, None)
+                        return status
+                    await asyncio.sleep(0.01)
+                self.fail("server-owned install did not finish after stream disconnect")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            previous_root = registry_module.EXTENSIONS_DIR
+            registry_module.EXTENSIONS_DIR = Path(tmp)
+            try:
+                status = asyncio.run(scenario(Path(tmp)))
+            finally:
+                registry_module.EXTENSIONS_DIR = previous_root
+
+        self.assertEqual(status["terminal"]["step"], "result")
+        self.assertEqual(status["terminal"]["extensionId"], "example")
+
+    def test_terminal_install_status_survives_a_lost_progress_stream(self) -> None:
+        install_id = "a" * 32
+        terminal = {"step": "result", "success": True, "extensionId": "example"}
+        _install_jobs[install_id] = {
+            "latest": terminal,
+            "terminal": terminal,
+            "updated_at": 1e30,
+        }
+        try:
+            status = asyncio.run(install_github_status(install_id))
+        finally:
+            _install_jobs.pop(install_id, None)
+
+        self.assertTrue(status["done"])
+        self.assertEqual(status["terminal"], terminal)
+
+
 class ServerExtensionInstallerTests(unittest.TestCase):
+    def test_cuda_setup_keeps_pypi_available_for_torch_build_dependencies(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            env = extension_setup_environment("cuda")
+        self.assertEqual(env["PIP_EXTRA_INDEX_URL"], "https://pypi.org/simple")
+        self.assertEqual(env["MODLY_TORCH_FLAVOR"], "cuda")
+
+    def test_cuda_setup_preserves_an_operator_pip_fallback(self) -> None:
+        with patch.dict(os.environ, {"PIP_EXTRA_INDEX_URL": "https://packages.example/simple"}, clear=True):
+            env = extension_setup_environment("cuda")
+        self.assertEqual(env["PIP_EXTRA_INDEX_URL"], "https://packages.example/simple")
+
+    def test_non_cuda_setup_does_not_add_a_second_package_index(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            env = extension_setup_environment("cpu")
+        self.assertNotIn("PIP_EXTRA_INDEX_URL", env)
+
     def test_failed_setup_streams_output_and_preserves_traceback_details(self) -> None:
         events: list[dict] = []
 

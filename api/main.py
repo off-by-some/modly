@@ -118,7 +118,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-HF-Token", "X-Modly-Filename"],
     # drei's SplatLoader reads Content-Length to size its buffers; cross-origin
     # JS can only see it when the server explicitly exposes the header.
-    expose_headers=["Content-Length"],
+    expose_headers=["Content-Length", "X-Modly-Install-Id"],
 )
 
 app.include_router(status.router)

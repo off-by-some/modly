@@ -8,6 +8,8 @@ import sys
 import shutil
 import logging
 import traceback
+import time
+import uuid
 from pathlib import Path
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import StreamingResponse
@@ -16,6 +18,8 @@ from pydantic import BaseModel, Field
 router = APIRouter(tags=["extensions"])
 _install_tasks: set[asyncio.Task] = set()
 _install_logger = logging.getLogger("modly.extensions.install")
+_install_jobs: dict[str, dict[str, object]] = {}
+_INSTALL_JOB_TTL_SECONDS = 60 * 60
 
 _SAFE_EXTENSION_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -138,6 +142,17 @@ class ProcessRun(BaseModel):
     params: dict = Field(default_factory=dict)
 
 
+def _prune_install_jobs() -> None:
+    cutoff = time.monotonic() - _INSTALL_JOB_TTL_SECONDS
+    expired = [
+        install_id
+        for install_id, job in _install_jobs.items()
+        if job.get("terminal") is not None and float(job.get("updated_at", 0)) < cutoff
+    ]
+    for install_id in expired:
+        _install_jobs.pop(install_id, None)
+
+
 @router.post("/run-process")
 async def run_process(body: ProcessRun):
     extension_dir = _extension_path(body.extension_id)
@@ -208,11 +223,24 @@ async def install_from_github(body: GitHubInstall):
     """Fetch and install on the server, returning newline-delimited SSE progress."""
     from services.extension_installer import install_github
 
+    _prune_install_jobs()
+    install_id = uuid.uuid4().hex
+    job: dict[str, object] = {
+        "latest": None,
+        "terminal": None,
+        "updated_at": time.monotonic(),
+    }
+    _install_jobs[install_id] = job
+
     async def events():
         queue: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=100)
         connected = True
 
         async def emit(event: dict) -> None:
+            job["latest"] = event
+            job["updated_at"] = time.monotonic()
+            if event.get("step") in ("result", "error"):
+                job["terminal"] = event
             if not connected:
                 return
             if queue.full():
@@ -265,8 +293,24 @@ async def install_from_github(body: GitHubInstall):
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+            "X-Modly-Install-Id": install_id,
         },
     )
+
+
+@router.get("/install-github/{install_id}/status")
+async def install_github_status(install_id: str):
+    """Return recoverable progress when an install's SSE connection is lost."""
+    _prune_install_jobs()
+    job = _install_jobs.get(install_id)
+    if job is None:
+        raise HTTPException(404, "Extension installation is no longer available")
+    terminal = job.get("terminal")
+    return {
+        "done": terminal is not None,
+        "latest": job.get("latest"),
+        "terminal": terminal,
+    }
 
 
 @router.delete("/{extension_id}")
@@ -330,6 +374,8 @@ async def setup_extension(ext_id: str):
     gpu_sm, cuda_version = _detect_nvidia_gpu()
     gfx_target           = "" if gpu_sm else _detect_gfx_target()
     flavor               = "cuda" if gpu_sm else ("rocm" if gfx_target else "cpu")
+    torch_index_url      = _rocm_index_url() if flavor == "rocm" else ""
+    torch_specs          = ["torch", "torchvision"] if flavor == "rocm" else []
 
     # Pass arguments as JSON so setup.py sees torch_flavor. The keys mirror
     # runExtensionSetup in electron/main/ipc-handlers.ts exactly — setup.py
@@ -345,10 +391,12 @@ async def setup_extension(ext_id: str):
         "accelerator":     flavor,
         "torch_flavor":    flavor,
         "gfx_target":      gfx_target,
-        "torch_index_url": _rocm_index_url() if flavor == "rocm" else "",
+        "torch_index_url": torch_index_url,
         "platform":        sys.platform,
         "arch":            _node_arch(),
     })
+
+    from services.extension_installer import extension_setup_environment
 
     # Run setup.py using Modly's embedded Python (sys.executable)
     loop   = asyncio.get_running_loop()
@@ -363,6 +411,7 @@ async def setup_extension(ext_id: str):
             # successful setup into a 500 with no usable message.
             encoding="utf-8",
             errors="replace",
+            env=extension_setup_environment(flavor, torch_index_url, torch_specs),
         )
     )
 

@@ -141,6 +141,9 @@ function runExtensionSetup(
         MODLY_TORCH_FLAVOR:    torchFlavor,
         MODLY_TORCH_INDEX_URL: gpu.torchIndexUrl ?? '',
         MODLY_TORCH_SPECS:     JSON.stringify(gpu.torchSpecs ?? []),
+        ...(gpu.accelerator === 'cuda' && process.env.PIP_EXTRA_INDEX_URL === undefined
+          ? { PIP_EXTRA_INDEX_URL: process.env.MODLY_EXTENSION_PYPI_INDEX_URL ?? 'https://pypi.org/simple' }
+          : {}),
       },
     })
 
@@ -1823,8 +1826,25 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
             headers: { Accept: 'text/event-stream' },
           },
         )
+        const installId = String(response.headers['x-modly-install-id'] ?? '')
         let buffer = ''
         let result: Record<string, unknown> | null = null
+        let lastEvent = ''
+        const acceptEvent = (installEvent: Record<string, unknown>) => {
+          const fingerprint = JSON.stringify(installEvent)
+          if (fingerprint === lastEvent) return
+          lastEvent = fingerprint
+          if (installEvent.step === 'result') result = installEvent
+          else {
+            if (installEvent.step === 'error') {
+              serverError = {
+                message: String(installEvent.message ?? 'Extension installation failed'),
+                details: typeof installEvent.details === 'string' ? installEvent.details : undefined,
+              }
+            }
+            emit(installEvent)
+          }
+        }
         const consumeEvent = (block: string) => {
           const payload = block
             .split('\n')
@@ -1832,27 +1852,54 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
             .map((line) => line.slice(5).trimStart())
             .join('\n')
           if (!payload) return
-          const event = JSON.parse(payload) as Record<string, unknown>
-          if (event.step === 'result') result = event
-          else {
-            if (event.step === 'error') {
-              serverError = {
-                message: String(event.message ?? 'Extension installation failed'),
-                details: typeof event.details === 'string' ? event.details : undefined,
+          acceptEvent(JSON.parse(payload) as Record<string, unknown>)
+        }
+        let streamFailure: unknown = null
+        try {
+          for await (const chunk of response.data) {
+            buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk)
+            const blocks = buffer.split(/\r?\n\r?\n/)
+            buffer = blocks.pop() ?? ''
+            for (const block of blocks) consumeEvent(block)
+          }
+          if (buffer.trim()) consumeEvent(buffer)
+        } catch (error) {
+          streamFailure = error
+        }
+
+        // The server owns the transaction after it starts. If a long wheel
+        // download outlives the SSE socket, recover its latest/terminal state
+        // instead of reporting a false failure while setup continues remotely.
+        if (!result && !serverError && installId) {
+          let consecutiveFailures = 0
+          for (let attempt = 0; attempt < 1800 && !result && !serverError; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 2_000))
+            try {
+              const status = await axios.get<{
+                done: boolean
+                latest?: Record<string, unknown> | null
+                terminal?: Record<string, unknown> | null
+              }>(`${selectedApiUrl()}/extensions/install-github/${encodeURIComponent(installId)}/status`, {
+                timeout: 10_000,
+              })
+              consecutiveFailures = 0
+              const recovered = status.data.terminal ?? status.data.latest
+              if (recovered) acceptEvent(recovered)
+              if (status.data.done && !status.data.terminal) {
+                throw new Error('The server completed the install without terminal status')
+              }
+            } catch (error) {
+              consecutiveFailures += 1
+              if (consecutiveFailures >= 30) {
+                throw new Error(`Lost the install progress stream and could not recover server status: ${String(error)}`)
               }
             }
-            emit(event)
           }
         }
-        for await (const chunk of response.data) {
-          buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk)
-          const blocks = buffer.split(/\r?\n\r?\n/)
-          buffer = blocks.pop() ?? ''
-          for (const block of blocks) consumeEvent(block)
-        }
-        if (buffer.trim()) consumeEvent(buffer)
         if (serverError) throw new Error(serverError.message)
-        if (!result || result.success !== true) throw new Error('The server ended the install without a result')
+        if (!result || result.success !== true) {
+          throw streamFailure ?? new Error('The server ended the install without a result')
+        }
         emit({ step: 'done', extensionId: result.extensionId })
         return result
       } catch (err) {
