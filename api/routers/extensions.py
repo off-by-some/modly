@@ -274,7 +274,7 @@ async def install_from_github(body: GitHubInstall):
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=15)
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     # Keep reverse proxies from buffering or retiring an idle
                     # install while a setup command is temporarily silent.
                     yield ": keep-alive\n\n"

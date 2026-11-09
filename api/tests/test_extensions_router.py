@@ -24,6 +24,7 @@ from services.extension_installer import (
     _run_command,
     extension_setup_environment,
     extract_archive,
+    install_github,
     parse_github_repository,
     recover_interrupted_installs,
     validate_manifest,
@@ -142,6 +143,60 @@ class ExtensionInstallStatusTests(unittest.TestCase):
 
 
 class ServerExtensionInstallerTests(unittest.TestCase):
+    def test_server_install_clears_quarantine_only_for_authorized_validation(self) -> None:
+        async def fake_download(_url: str, _archive: Path, progress) -> None:
+            await progress({"step": "downloading", "percent": 80})
+
+        def fake_extract(_archive: Path, destination: Path) -> None:
+            (destination / "manifest.json").write_text(json.dumps({
+                "id": "example",
+                "type": "model",
+                "generator_class": "TestGenerator",
+                "nodes": [{"id": "generate"}],
+            }))
+            (destination / "generator.py").write_text(
+                "from services.generators.base import BaseGenerator\n"
+                "class TestGenerator(BaseGenerator):\n"
+                "    def load(self): pass\n"
+                "    def generate(self, image_bytes, params, progress_cb=None, cancel_event=None):\n"
+                "        return self.outputs_dir / 'result.glb'\n"
+            )
+
+        async def fake_setup(_destination: Path, _manifest: dict, _entry: str, _progress) -> None:
+            return None
+
+        async def scenario(root: Path) -> tuple[dict, list[dict]]:
+            events: list[dict] = []
+
+            async def progress(event: dict) -> None:
+                events.append(event)
+
+            with (
+                patch("services.extension_installer._download_archive", new=fake_download),
+                patch("services.extension_installer.extract_archive", new=fake_extract),
+                patch("services.extension_installer._setup_extension", new=fake_setup),
+            ):
+                result = await install_github("https://github.com/acme/example", root, progress)
+            return result, events
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous_root = registry_module.EXTENSIONS_DIR
+            previous_registry = registry_module.generator_registry
+            registry_module.EXTENSIONS_DIR = root
+            registry_module.generator_registry = registry_module.GeneratorRegistry()
+            try:
+                result, events = asyncio.run(scenario(root))
+                self.assertIn("example/generate", registry_module.generator_registry._generators)
+            finally:
+                registry_module.generator_registry = previous_registry
+                registry_module.EXTENSIONS_DIR = previous_root
+
+            self.assertTrue(result["success"])
+            self.assertFalse((root / "example" / ".modly-incomplete").exists())
+            self.assertEqual(list(root.glob(".modly-registration-pending-example-*")), [])
+            self.assertEqual(events[-1], {"step": "done", "extensionId": "example"})
+
     def test_cuda_setup_keeps_pypi_available_for_torch_build_dependencies(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             env = extension_setup_environment("cuda")
@@ -234,6 +289,38 @@ class ServerExtensionInstallerTests(unittest.TestCase):
             (backup / "previous.txt").write_text("ok")
             recover_interrupted_installs(root)
             self.assertEqual((destination / "previous.txt").read_text(), "ok")
+
+    def test_recovery_rolls_back_registration_interrupted_after_marker_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "my-extension"
+            destination.mkdir()
+            (destination / "new.txt").write_text("unvalidated")
+            backup = root / f".modly-backup-my-extension-{'a' * 32}"
+            backup.mkdir()
+            (backup / "previous.txt").write_text("ok")
+            state = root / ".modly-registration-pending-my-extension-100"
+            state.write_text("{}")
+
+            recover_interrupted_installs(root)
+
+            self.assertEqual((destination / "previous.txt").read_text(), "ok")
+            self.assertFalse((destination / "new.txt").exists())
+            self.assertFalse(state.exists())
+
+    def test_recovery_removes_unvalidated_fresh_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "my-extension"
+            destination.mkdir()
+            (destination / "new.txt").write_text("unvalidated")
+            state = root / ".modly-registration-pending-my-extension-100"
+            state.write_text("{}")
+
+            recover_interrupted_installs(root)
+
+            self.assertFalse(destination.exists())
+            self.assertFalse(state.exists())
 
 
 class BuiltinExtensionSyncTests(unittest.TestCase):

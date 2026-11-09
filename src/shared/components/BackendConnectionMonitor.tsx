@@ -6,6 +6,8 @@ import { useWorkflowsStore } from '@shared/stores/workflowsStore'
 import { useLlmModelsStore } from '@shared/stores/llmModelsStore'
 
 const HEALTH_CHECK_INTERVAL_MS = 10_000
+const FAILURES_BEFORE_PROMPT = 3
+const FAILURES_BEFORE_FALLBACK = 6
 
 export function BackendConnectionMonitor(): JSX.Element | null {
   const backendMode = useAppStore((state) => state.backendMode)
@@ -52,14 +54,15 @@ export function BackendConnectionMonitor(): JSX.Element | null {
         setVisible(false)
         setError('')
         dismissedForOutage.current = false
+        automaticFallbackEnabled.current = true
         return true
       } catch (cause) {
         if (cancelled) return false
-        setRemoteBackendStatus('offline')
         consecutiveFailures.current += 1
+        setRemoteBackendStatus(consecutiveFailures.current >= FAILURES_BEFORE_PROMPT ? 'offline' : 'unknown')
         setError(cause instanceof Error ? cause.message : 'Could not connect to this Modly server.')
-        if (!dismissedForOutage.current) setVisible(true)
-        if (consecutiveFailures.current >= 3 && automaticFallbackEnabled.current && !fallbackInProgress.current) {
+        if (consecutiveFailures.current >= FAILURES_BEFORE_PROMPT && !dismissedForOutage.current) setVisible(true)
+        if (consecutiveFailures.current >= FAILURES_BEFORE_FALLBACK && automaticFallbackEnabled.current && !fallbackInProgress.current) {
           fallbackInProgress.current = true
           setSwitching(true)
           try {
@@ -71,7 +74,7 @@ export function BackendConnectionMonitor(): JSX.Element | null {
                 useWorkflowsStore.getState().load(),
                 useLlmModelsStore.getState().fetchModels(selectedApiUrl, { force: true }),
               ])
-              const message = 'The custom server went offline. Modly switched to the bundled server.'
+              const message = 'The custom server went offline. Modly swapped to the local server.'
               showToast(message, 7000)
               void window.electron.notifications.show('Modly server changed', message)
               setVisible(false)
@@ -79,7 +82,7 @@ export function BackendConnectionMonitor(): JSX.Element | null {
           } catch (fallbackError) {
             fallbackInProgress.current = false
             if (!cancelled) {
-              setError(fallbackError instanceof Error ? fallbackError.message : 'Could not start the bundled server.')
+              setError(fallbackError instanceof Error ? fallbackError.message : 'Could not start the local server.')
             }
           } finally {
             if (!cancelled) setSwitching(false)
@@ -106,14 +109,14 @@ export function BackendConnectionMonitor(): JSX.Element | null {
     }
   }, [allowInsecureRemote, apiToken, apiUrl, backendMode, setBackendServer, setRemoteBackendStatus, showToast])
 
-  async function handleSwitchToBundled(): Promise<void> {
+  async function handleSwitchToLocal(): Promise<void> {
     setSwitching(true)
     setError('')
     try {
       await setBackendServer('local')
       setVisible(false)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Could not start the bundled server.')
+      setError(cause instanceof Error ? cause.message : 'Could not start the local server.')
     } finally {
       setSwitching(false)
     }
@@ -153,7 +156,7 @@ export function BackendConnectionMonitor(): JSX.Element | null {
 
         <div className="px-5 py-4">
           <p className="text-xs leading-5 text-zinc-300">
-            Modly will retry this connection and automatically switch to the bundled server after three failed checks. You can retry or switch now.
+            Modly will keep retrying and automatically swap to the local server if the outage continues. You can retry or swap now.
           </p>
           {error && <p className="mt-3 rounded-lg border border-red-900/30 bg-red-950/30 px-3 py-2 text-[11px] text-red-400">{error}</p>}
         </div>
@@ -174,11 +177,11 @@ export function BackendConnectionMonitor(): JSX.Element | null {
             {checking ? 'Checking…' : 'Retry'}
           </button>
           <button
-            onClick={() => void handleSwitchToBundled()}
+            onClick={() => void handleSwitchToLocal()}
             disabled={checking || switching}
             className="rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-accent-dark disabled:opacity-50"
           >
-            {switching ? 'Starting…' : 'Switch to bundled'}
+            {switching ? 'Starting…' : 'Swap to Local Server'}
           </button>
         </div>
       </div>

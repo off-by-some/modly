@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sys
 import tarfile
@@ -28,6 +29,7 @@ MAX_EXTRACTED_BYTES = optional_env_limit("MODLY_MAX_EXTENSION_EXTRACTED_BYTES")
 MAX_ARCHIVE_MEMBERS = optional_env_limit("MODLY_MAX_EXTENSION_ARCHIVE_MEMBERS")
 SETUP_TIMEOUT_SECONDS = int(os.environ.get("MODLY_EXTENSION_SETUP_TIMEOUT", 30 * 60))
 INCOMPLETE_MARKER = ".modly-incomplete"
+REGISTRATION_PENDING_PREFIX = ".modly-registration-pending-"
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _install_lock = asyncio.Lock()
 
@@ -65,6 +67,57 @@ def extension_setup_environment(
         if fallback:
             env["PIP_EXTRA_INDEX_URL"] = fallback
     return env
+
+
+def _registration_state_paths(root: Path, extension_id: str) -> list[Path]:
+    prefix = f"{REGISTRATION_PENDING_PREFIX}{extension_id}-"
+    return [
+        path for path in root.glob(f"{prefix}*")
+        if path.name.removeprefix(prefix).isdigit()
+    ]
+
+
+def _begin_registration(root: Path, extension_id: str) -> tuple[dict[str, str], Path]:
+    """Create the one-use capability consumed by GeneratorRegistry.reload."""
+    token = secrets.token_urlsafe(32)
+    for _ in range(10):
+        state_name = f"{REGISTRATION_PENDING_PREFIX}{extension_id}-{uuid.uuid4().int}"
+        state_path = root / state_name
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(state_path, flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            try:
+                if os.name != "nt":
+                    os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    descriptor = -1
+                    json.dump({
+                        "version": 1,
+                        "extensionId": extension_id,
+                        "destinationName": extension_id,
+                        "token": token,
+                        "consumed": False,
+                    }, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        except BaseException:
+            state_path.unlink(missing_ok=True)
+            raise
+        return ({
+            "extensionId": extension_id,
+            "destinationName": extension_id,
+            "stateName": state_name,
+            "token": token,
+        }, state_path)
+    raise RuntimeError("Could not create extension runtime registration state")
 
 
 def parse_github_repository(value: str) -> tuple[str, str, str]:
@@ -295,6 +348,16 @@ def recover_interrupted_installs(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     for staging in root.glob(".modly-install-*"):
         shutil.rmtree(staging, ignore_errors=True)
+    pending_ids = {
+        remainder.rsplit("-", 1)[0]
+        for state in root.glob(f"{REGISTRATION_PENDING_PREFIX}*")
+        if (
+            (remainder := state.name.removeprefix(REGISTRATION_PENDING_PREFIX))
+            and "-" in remainder
+            and remainder.rsplit("-", 1)[1].isdigit()
+            and _SAFE_ID.fullmatch(remainder.rsplit("-", 1)[0])
+        )
+    }
     for backup in root.glob(".modly-backup-*"):
         remainder = backup.name.removeprefix(".modly-backup-")
         if "-" not in remainder:
@@ -303,11 +366,21 @@ def recover_interrupted_installs(root: Path) -> None:
         if not _SAFE_ID.fullmatch(extension_id):
             continue
         destination = root / extension_id
-        if destination.exists() and not (destination / INCOMPLETE_MARKER).exists():
-            shutil.rmtree(backup, ignore_errors=True)
-        elif not destination.exists() or (destination / INCOMPLETE_MARKER).exists():
+        if extension_id in pending_ids or not destination.exists() or (destination / INCOMPLETE_MARKER).exists():
             shutil.rmtree(destination, ignore_errors=True)
             backup.rename(destination)
+            for state in _registration_state_paths(root, extension_id):
+                state.unlink(missing_ok=True)
+            pending_ids.discard(extension_id)
+        else:
+            shutil.rmtree(backup, ignore_errors=True)
+    # A fresh install has no backup. Pending registration still means its
+    # runtime was never committed, so discard it instead of exposing an
+    # unvalidated extension after restart.
+    for extension_id in pending_ids:
+        shutil.rmtree(root / extension_id, ignore_errors=True)
+        for state in _registration_state_paths(root, extension_id):
+            state.unlink(missing_ok=True)
 
 
 async def install_github(url: str, root: Path, progress: Progress) -> dict:
@@ -320,6 +393,8 @@ async def install_github(url: str, root: Path, progress: Progress) -> dict:
         extracted.mkdir()
         destination: Path | None = None
         backup: Path | None = None
+        registration_state: Path | None = None
+        activated = False
         try:
             await _download_archive(f"https://api.github.com/repos/{owner}/{repo}/tarball/HEAD", archive_path, progress)
             await progress({"step": "extracting"})
@@ -342,24 +417,31 @@ async def install_github(url: str, root: Path, progress: Progress) -> dict:
             if destination.exists():
                 destination.rename(backup)
             extracted.rename(destination)
+            activated = True
             await _setup_extension(destination, manifest, entry, progress)
 
             from services.generator_registry import generator_registry
-            await asyncio.to_thread(generator_registry.reload)
+            validation_capability, registration_state = _begin_registration(root, extension_id)
+            (destination / INCOMPLETE_MARKER).unlink()
+            await asyncio.to_thread(generator_registry.reload, validation_capability)
             errors = generator_registry.load_errors()
             relevant = {key: value for key, value in errors.items() if key == extension_id or key.startswith(f"{extension_id}/")}
             if relevant:
                 raise RuntimeError("Extension runtime validation failed: " + "; ".join(relevant.values()))
-            (destination / INCOMPLETE_MARKER).unlink(missing_ok=True)
+            registration_state.unlink(missing_ok=True)
+            registration_state = None
             if backup.exists():
                 shutil.rmtree(backup, ignore_errors=True)
             await progress({"step": "done", "extensionId": extension_id})
             return {"success": True, "extensionId": extension_id, "manifest": manifest}
         except Exception:
-            if destination and destination.exists() and (destination / INCOMPLETE_MARKER).exists():
+            if activated and destination and destination.exists():
                 shutil.rmtree(destination, ignore_errors=True)
             if destination and backup and backup.exists() and not destination.exists():
                 backup.rename(destination)
+            if registration_state is not None:
+                registration_state.unlink(missing_ok=True)
+            if activated:
                 try:
                     from services.generator_registry import generator_registry
                     await asyncio.to_thread(generator_registry.reload)
