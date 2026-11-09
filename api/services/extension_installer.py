@@ -18,11 +18,12 @@ from urllib.parse import urlparse
 import httpx
 
 from services.builtin_extensions import BUILTIN_MARKER
+from services.upload_limits import optional_env_limit
 
 
-MAX_ARCHIVE_BYTES = int(os.environ.get("MODLY_MAX_EXTENSION_ARCHIVE_BYTES", 100 * 1024 * 1024))
-MAX_EXTRACTED_BYTES = int(os.environ.get("MODLY_MAX_EXTENSION_EXTRACTED_BYTES", 1024 * 1024 * 1024))
-MAX_ARCHIVE_MEMBERS = int(os.environ.get("MODLY_MAX_EXTENSION_ARCHIVE_MEMBERS", 20_000))
+MAX_ARCHIVE_BYTES = optional_env_limit("MODLY_MAX_EXTENSION_ARCHIVE_BYTES")
+MAX_EXTRACTED_BYTES = optional_env_limit("MODLY_MAX_EXTENSION_EXTRACTED_BYTES")
+MAX_ARCHIVE_MEMBERS = optional_env_limit("MODLY_MAX_EXTENSION_ARCHIVE_MEMBERS")
 SETUP_TIMEOUT_SECONDS = int(os.environ.get("MODLY_EXTENSION_SETUP_TIMEOUT", 30 * 60))
 INCOMPLETE_MARKER = ".modly-incomplete"
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -57,12 +58,12 @@ async def _download_archive(url: str, archive_path: Path, progress: Progress) ->
         async with client.stream("GET", url, headers={"User-Agent": "Modly-Server"}) as response:
             response.raise_for_status()
             declared = int(response.headers.get("content-length", "0") or 0)
-            if declared > MAX_ARCHIVE_BYTES:
+            if MAX_ARCHIVE_BYTES is not None and declared > MAX_ARCHIVE_BYTES:
                 raise ValueError("Extension archive is larger than the server limit")
             with archive_path.open("wb") as output:
                 async for chunk in response.aiter_bytes(1024 * 1024):
                     received += len(chunk)
-                    if received > MAX_ARCHIVE_BYTES:
+                    if MAX_ARCHIVE_BYTES is not None and received > MAX_ARCHIVE_BYTES:
                         raise ValueError("Extension archive is larger than the server limit")
                     output.write(chunk)
                     percent = min(80, round(received / declared * 80)) if declared else 20
@@ -80,7 +81,7 @@ def _safe_archive_relative(name: str, root_name: str) -> Path | None:
 def extract_archive(archive_path: Path, destination: Path) -> None:
     with tarfile.open(archive_path, "r:gz") as archive:
         members = archive.getmembers()
-        if len(members) > MAX_ARCHIVE_MEMBERS:
+        if MAX_ARCHIVE_MEMBERS is not None and len(members) > MAX_ARCHIVE_MEMBERS:
             raise ValueError("Extension archive contains too many files")
         roots = {PurePosixPath(member.name).parts[0] for member in members if member.name}
         if len(roots) != 1:
@@ -95,7 +96,7 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
             if member.issym() or member.islnk() or member.isdev() or member.isfifo():
                 raise ValueError("Archive links and special files are not supported")
             total_size += max(0, member.size)
-            if total_size > MAX_EXTRACTED_BYTES:
+            if MAX_EXTRACTED_BYTES is not None and total_size > MAX_EXTRACTED_BYTES:
                 raise ValueError("Extension expands beyond the server limit")
             target = (destination / relative).resolve()
             if destination_resolved not in target.parents:

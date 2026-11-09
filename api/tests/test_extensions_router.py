@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import services.generator_registry as registry_module
 from routers.extensions import reload_extensions
@@ -17,6 +18,7 @@ from services.extension_installer import (
     recover_interrupted_installs,
     validate_manifest,
 )
+from services.upload_limits import optional_env_limit
 
 
 class _FakeRegistry:
@@ -159,6 +161,29 @@ class BuiltinExtensionSyncTests(unittest.TestCase):
                     os.environ.pop("MODLY_BUILTIN_EXTENSIONS_DIR", None)
                 else:
                     os.environ["MODLY_BUILTIN_EXTENSIONS_DIR"] = old
+
+
+class OptionalServerLimitTests(unittest.TestCase):
+    def test_limits_are_unlimited_by_default_and_accept_unlimited_aliases(self) -> None:
+        for value in (None, "", "0", "none", "unlimited"):
+            with self.subTest(value=value):
+                environment = {} if value is None else {"MODLY_TEST_LIMIT": value}
+                with patch.dict(os.environ, environment, clear=True):
+                    self.assertIsNone(optional_env_limit("MODLY_TEST_LIMIT"))
+
+    def test_specific_limit_overrides_global_upload_limit(self) -> None:
+        with patch.dict(os.environ, {
+            "MODLY_MAX_UPLOAD_BYTES": "100",
+            "MODLY_MAX_IMAGE_UPLOAD_BYTES": "25",
+        }, clear=True):
+            self.assertEqual(
+                optional_env_limit("MODLY_MAX_IMAGE_UPLOAD_BYTES", "MODLY_MAX_UPLOAD_BYTES"),
+                25,
+            )
+            self.assertEqual(
+                optional_env_limit("MODLY_MAX_ASSET_UPLOAD_BYTES", "MODLY_MAX_UPLOAD_BYTES"),
+                100,
+            )
 
 
 if __name__ == "__main__":

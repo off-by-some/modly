@@ -16,6 +16,7 @@ except ModuleNotFoundError:  # A just-upgraded server can still report basic Uni
     psutil = None
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
+from services.upload_limits import optional_env_limit
 
 
 router = APIRouter(tags=["server"])
@@ -195,14 +196,14 @@ async def upload_workspace_file(request: Request, x_modly_filename: str = Header
     upload_dir.mkdir(parents=True, exist_ok=True)
     destination = upload_dir / f"{uuid.uuid4().hex}-{file_name}"
     partial = destination.with_suffix(destination.suffix + ".uploading")
-    max_bytes = int(os.environ.get("MODLY_MAX_ASSET_UPLOAD_BYTES", 1024 * 1024 * 1024))
+    max_bytes = optional_env_limit("MODLY_MAX_ASSET_UPLOAD_BYTES", "MODLY_MAX_UPLOAD_BYTES")
     received = 0
     try:
         with partial.open("xb") as output:
             async for chunk in request.stream():
                 if chunk:
                     received += len(chunk)
-                    if received > max_bytes:
+                    if max_bytes is not None and received > max_bytes:
                         raise HTTPException(413, "Asset exceeds the server upload limit")
                     output.write(chunk)
     except HTTPException:

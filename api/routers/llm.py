@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
+from services.upload_limits import optional_env_limit
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -136,14 +137,14 @@ async def upload_model(request: Request, x_modly_filename: str = Header(...)):
     if partial.exists():
         raise HTTPException(status_code=409, detail=f'An upload for "{file_name}" is already in progress')
 
-    max_bytes = int(os.environ.get("MODLY_MAX_GGUF_UPLOAD_BYTES", 32 * 1024 * 1024 * 1024))
+    max_bytes = optional_env_limit("MODLY_MAX_GGUF_UPLOAD_BYTES", "MODLY_MAX_UPLOAD_BYTES")
     received = 0
     try:
         with partial.open("xb") as output:
             async for chunk in request.stream():
                 if chunk:
                     received += len(chunk)
-                    if received > max_bytes:
+                    if max_bytes is not None and received > max_bytes:
                         raise HTTPException(413, "GGUF exceeds the server upload limit")
                     output.write(chunk)
         partial.replace(destination)

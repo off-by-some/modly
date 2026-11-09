@@ -16,7 +16,7 @@ from routers.generation import (
 )
 from schemas.generation import JobStatus
 from services.generator_registry import generator_registry
-from services.upload_limits import read_upload_limited
+from services.upload_limits import optional_env_limit, read_upload_limited
 
 router = APIRouter(tags=["workflow-runs"])
 
@@ -71,7 +71,11 @@ async def create_run_from_image(
         raise HTTPException(400, str(e))
 
     job_id = str(uuid.uuid4())
-    image_bytes = await read_upload_limited(image, 50 * 1024 * 1024, "Image")
+    image_bytes = await read_upload_limited(
+        image,
+        optional_env_limit("MODLY_MAX_IMAGE_UPLOAD_BYTES", "MODLY_MAX_UPLOAD_BYTES"),
+        "Image",
+    )
 
     _purge_old_jobs()
 
