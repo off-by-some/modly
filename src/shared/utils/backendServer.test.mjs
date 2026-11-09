@@ -79,3 +79,19 @@ test('requires explicit consent before sending credentials over remote HTTP', as
     globalThis.window = originalWindow
   }
 })
+
+test('allows tokenless remote HTTP without an insecure-credentials override', async () => {
+  const originalWindow = globalThis.window
+  const originalFetch = globalThis.fetch
+  globalThis.window = { setTimeout, clearTimeout }
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ status: 'ok' }) })
+  try {
+    assert.equal(
+      await checkBackendServer('http://192.168.1.20:8765'),
+      'http://192.168.1.20:8765',
+    )
+  } finally {
+    globalThis.window = originalWindow
+    globalThis.fetch = originalFetch
+  }
+})

@@ -119,7 +119,7 @@ export function BackendSection(): JSX.Element {
               Modly will verify the server's <span className="font-mono">/health</span> endpoint before switching.
             </p>
             <label htmlFor="backend-token" className="block text-xs font-medium text-zinc-300 mb-2 mt-4">
-              Access token
+              Access token <span className="font-normal text-zinc-500">(optional)</span>
             </label>
             <input
               id="backend-token"
@@ -135,9 +135,9 @@ export function BackendSection(): JSX.Element {
               className="w-full rounded-lg border border-zinc-700 bg-surface-500 px-3 py-2 text-xs font-mono text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-accent/70"
             />
             <p className="text-[11px] text-zinc-500 mt-2">
-              Stored using your operating system's secure encryption. HTTPS is recommended outside a trusted private network.
+              Leave blank for a server without MODLY_SERVER_TOKEN. Entered tokens are stored using your operating system's secure encryption.
             </p>
-            {url.trim().toLowerCase().startsWith('http://') && !url.includes('127.0.0.1') && !url.includes('localhost') && (
+            {token.trim() && url.trim().toLowerCase().startsWith('http://') && !url.includes('127.0.0.1') && !url.includes('localhost') && (
               <label className="mt-3 flex items-start gap-2 text-[11px] text-amber-300">
                 <input
                   type="checkbox"

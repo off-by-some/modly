@@ -341,10 +341,10 @@ export const useAppStore = create<AppState>()(
           if (backendMode === 'remote' && remoteApiUrl) {
             try {
               const apiUrl = normalizeBackendUrl(remoteApiUrl)
-              assertBackendTransportAllowed(apiUrl, allowInsecureRemote)
               const apiToken = remoteApiTokenEncrypted
                 ? (await window.electron.secureStore.decrypt(remoteApiTokenEncrypted) ?? '')
                 : ''
+              assertBackendTransportAllowed(apiUrl, allowInsecureRemote, Boolean(apiToken))
               await window.electron.backend.select(apiUrl, apiToken)
               set({ backendStatus: 'ready', remoteBackendStatus: 'unknown', apiUrl, apiToken })
               return

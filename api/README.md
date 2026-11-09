@@ -23,11 +23,12 @@ uvicorn main:app --host 127.0.0.1 --port 8765 --reload
 
 ## Run as a remote server
 
-Non-loopback clients are rejected unless `MODLY_SERVER_TOKEN` is set. Generate a
-long random value, pass it to the server, and enter the same value in Modly's
-Settings → Backend panel. Put the API behind HTTPS when it crosses an untrusted
-network; the desktop app requires an explicit opt-in before sending a token over
-plain remote HTTP.
+`MODLY_SERVER_TOKEN` is optional. When it is unset the server accepts
+unauthenticated requests and prints a prominent security warning during startup.
+Set it to a long random value and enter the same value in Modly's Settings →
+Backend panel when the server is reachable by anything you do not fully trust.
+Put authenticated APIs behind HTTPS when they cross an untrusted network; the
+desktop app requires explicit consent before sending a token over remote HTTP.
 
 ```bash
 MODLY_SERVER_TOKEN="replace-with-a-long-random-token" \

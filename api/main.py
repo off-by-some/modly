@@ -4,7 +4,6 @@ Runs locally within the Electron app to provide AI inference endpoints.
 """
 import logging
 import os
-import ipaddress
 import secrets
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
@@ -37,6 +36,16 @@ from routers import generation, model, optimize, status, settings, extensions, e
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not os.environ.get("MODLY_SERVER_TOKEN", "").strip():
+        if os.environ.get("MODLY_DESKTOP_MANAGED") == "1":
+            logging.getLogger("modly.security").info(
+                "MODLY_SERVER_TOKEN is not set; the desktop-managed loopback API is unauthenticated."
+            )
+        else:
+            logging.getLogger("modly.security").warning(
+                "SECURITY WARNING: MODLY_SERVER_TOKEN is not set. "
+                "The Modly API is accepting unauthenticated requests from any client that can reach it."
+            )
     # The API owns its extension set. Restore any interrupted transaction and
     # refresh built-ins before the registry sees the directory.
     from services.generator_registry import generator_registry, EXTENSIONS_DIR
@@ -68,29 +77,14 @@ app = FastAPI(
 )
 
 
-def _is_loopback_client(host: str | None) -> bool:
-    if host in (None, "testclient"):
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return host == "localhost"
-
-
 @app.middleware("http")
 async def require_remote_authentication(request: Request, call_next):
-    """Keep an unconfigured server local-only; require a bearer token remotely."""
+    """Authentication is opt-in through MODLY_SERVER_TOKEN."""
     if request.method == "OPTIONS":
         return await call_next(request)
-    expected = os.environ.get("MODLY_SERVER_TOKEN", "")
-    if not expected and _is_loopback_client(request.client.host if request.client else None):
-        return await call_next(request)
+    expected = os.environ.get("MODLY_SERVER_TOKEN", "").strip()
     if not expected:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Remote access is disabled. Set MODLY_SERVER_TOKEN on the server."},
-        )
+        return await call_next(request)
     authorization = request.headers.get("authorization", "")
     supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
     if not supplied or not secrets.compare_digest(supplied, expected):
