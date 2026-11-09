@@ -73,7 +73,8 @@ async def lifespan(app: FastAPI):
 
 class _StatusFilter(logging.Filter):
     def filter(self, record):
-        return "/generate/status/" not in record.getMessage()
+        message = record.getMessage()
+        return "/generate/status/" not in message and "/model/managed-downloads" not in message
 
 logging.getLogger("uvicorn.access").addFilter(_StatusFilter())
 

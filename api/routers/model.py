@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 import os
 import socket
@@ -24,6 +25,8 @@ from services.model_sources import (
 )
 
 router = APIRouter(tags=["model"])
+_download_logger = logging.getLogger("modly.models.download")
+_download_logger.setLevel(logging.INFO)
 
 _SAFE_MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -135,7 +138,7 @@ def _download_source(
     for index, filename in enumerate(files, 1):
         _check_managed_download(control)
         try:
-            _download_file_streamed(
+            final_size = _download_file_streamed(
                 url=hf_hub_url(
                     repo_id=source["repo_id"],
                     filename=filename,
@@ -147,7 +150,7 @@ def _download_source(
                 total_files=len(files),
                 base_percent=0,
                 progress_cb=lambda message, i=index: on_progress(
-                    i, len(files), filename, message.get("percent", 0)
+                    i, len(files), filename, message
                 ),
                 control=control,
                 token=token,
@@ -156,7 +159,13 @@ def _download_source(
             raise ManagedDownloadPaused() from exc
         except DownloadCancelled as exc:
             raise ManagedDownloadCancelled() from exc
-        on_progress(index, len(files), filename, 100)
+        on_progress(index, len(files), filename, {
+            "percent": 100,
+            "status": "Downloaded",
+            "bytesDownloaded": final_size,
+            "totalBytes": final_size,
+            "stalledSeconds": 0,
+        })
         _check_managed_download(control)
 
 
@@ -169,6 +178,30 @@ class ManagedDownloadCancelled(Exception):
 
 
 _managed_download_controls: dict[str, dict] = {}
+
+
+def _append_managed_log(control: dict, message: str) -> None:
+    logs = control.setdefault("logs", [])
+    if not logs or logs[-1] != message:
+        logs.append(message)
+        del logs[:-100]
+        _download_logger.info("%s", message)
+
+
+def _managed_download_state(model_id: str, control: dict) -> dict:
+    return {
+        "modelId": model_id,
+        "variantId": control.get("variantId"),
+        "percent": control.get("percent", 0),
+        "status": control.get("status", "Downloading on server…"),
+        "file": control.get("file"),
+        "fileIndex": control.get("fileIndex"),
+        "totalFiles": control.get("totalFiles"),
+        "bytesDownloaded": control.get("bytesDownloaded", 0),
+        "totalBytes": control.get("totalBytes"),
+        "stalledSeconds": control.get("stalledSeconds", 0),
+        "logs": list(control.get("logs", [])),
+    }
 
 
 def _check_managed_download(control: dict[str, threading.Event]) -> None:
@@ -194,6 +227,10 @@ async def managed_download(model_id: str, variant_id: str | None = None):
         "cancel": threading.Event(),
         "percent": 0,
         "status": "Listing server download…",
+        "variantId": variant_id,
+        "bytesDownloaded": 0,
+        "stalledSeconds": 0,
+        "logs": ["Preparing server download"],
     }
     _managed_download_controls[model_id] = control
 
@@ -209,11 +246,34 @@ async def managed_download(model_id: str, variant_id: str | None = None):
         def download_source(source: dict, destination: Path) -> None:
             nonlocal completed_sources
             start = completed_sources / max(1, source_count)
+            control["status"] = f'Listing files from {source["repo_id"]}'
+            _append_managed_log(control, control["status"])
+            control.pop("loggedFile", None)
 
-            def report(index: int, total: int, filename: str, file_percent: int) -> None:
+            def report(index: int, total: int, filename: str, message: dict) -> None:
+                declared_total = message.get("totalBytes")
+                downloaded = message.get("bytesDownloaded", 0)
+                file_percent = (
+                    round(downloaded / declared_total * 100)
+                    if isinstance(declared_total, int) and declared_total > 0
+                    else message.get("percent", 0)
+                )
                 completed_files = (index - 1 + max(0, min(100, file_percent)) / 100) / total
                 control["percent"] = round((start + completed_files / max(1, source_count)) * 100)
-                control["status"] = f"Downloading {filename}"
+                control["status"] = message.get("status") or f"Downloading {filename}"
+                control["file"] = filename
+                control["fileIndex"] = index
+                control["totalFiles"] = total
+                control["bytesDownloaded"] = downloaded
+                control["totalBytes"] = declared_total
+                control["stalledSeconds"] = message.get("stalledSeconds", 0)
+                if control.get("loggedFile") != filename:
+                    control["loggedFile"] = filename
+                    _append_managed_log(control, f"Downloading {filename} ({index}/{total})")
+                if str(control["status"]).startswith("Retrying"):
+                    _append_managed_log(control, f'{filename}: {control["status"]}')
+                if file_percent >= 100:
+                    _append_managed_log(control, f"Downloaded {filename}")
 
             _download_source(source, destination, token, control, report)
             completed_sources += 1
@@ -271,28 +331,27 @@ async def managed_download(model_id: str, variant_id: str | None = None):
     try:
         await asyncio.to_thread(download)
     except ManagedDownloadPaused:
-        return {"success": False, "paused": True}
+        return {"success": False, "paused": True, "progress": _managed_download_state(model_id, control)}
     except ManagedDownloadCancelled:
         extension_root = registry_module.MODELS_DIR / extension_id
         for partial in extension_root.rglob("*.part") if extension_root.exists() else []:
             partial.unlink(missing_ok=True)
-        return {"success": False, "cancelled": True}
+        return {"success": False, "cancelled": True, "progress": _managed_download_state(model_id, control)}
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
     finally:
         if _managed_download_controls.get(model_id) is control:
             _managed_download_controls.pop(model_id, None)
-    return {"success": True}
+    control["percent"] = 100
+    control["status"] = "done"
+    _append_managed_log(control, "Download complete")
+    return {"success": True, "progress": _managed_download_state(model_id, control)}
 
 
 @router.get("/managed-downloads")
 async def managed_downloads():
     return [
-        {
-            "modelId": model_id,
-            "percent": control.get("percent", 0),
-            "status": control.get("status", "Downloading on server…"),
-        }
+        _managed_download_state(model_id, control)
         for model_id, control in _managed_download_controls.items()
     ]
 

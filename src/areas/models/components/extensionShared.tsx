@@ -11,6 +11,7 @@ export interface DownloadInfo {
   bytesDownloaded?: number
   totalBytes?: number
   stalledSeconds?: number
+  logs?: string[]
   paused?: boolean
   variantId?: string   // set when the download targets one weight variant of the node
 }

@@ -66,6 +66,13 @@ function storeFolders(names: string[], colors: Record<string, string>, bookmarke
   try { localStorage.setItem(FOLDERS_KEY, JSON.stringify({ names, colors, bookmarked })) } catch { /* quota/private mode */ }
 }
 
+// Workflow edits can be produced by both the canvas and the Generate panel.
+// Keep writes for one workflow ordered, and let load() protect the optimistic
+// local revision while a remote request is still in flight.
+const workflowSaveTails = new Map<string, Promise<void>>()
+const workflowSaveRevisions = new Map<string, number>()
+const workflowSaveConfirmed = new Map<string, Workflow | undefined>()
+
 /** Least-used palette color, so new folders spread across the palette. */
 function nextFolderColor(colors: Record<string, string>): string {
   const used = Object.values(colors)
@@ -179,6 +186,7 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
 
   async load() {
     set({ loading: true })
+    const pendingAtStart = new Set(workflowSaveTails.keys())
     try {
       const raw  = await window.electron.workflows.list()
       // Dedupe by id: two files on disk can share an internal id (e.g. a copied
@@ -193,16 +201,30 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
         list.push(wf)
       }
       set((s) => {
+        // A remote list can have been read just before an in-flight save landed.
+        // Preserve that workflow's optimistic local copy instead of flashing an
+        // older node graph into the editor and letting it become the next save.
+        const protectedIds = new Set([...pendingAtStart, ...workflowSaveTails.keys()])
+        const localById = new Map(s.workflows.map((workflow) => [workflow.id, workflow]))
+        const merged = list.map((workflow) =>
+          protectedIds.has(workflow.id) && localById.has(workflow.id)
+            ? localById.get(workflow.id)!
+            : workflow,
+        )
+        for (const id of protectedIds) {
+          const local = localById.get(id)
+          if (local && !merged.some((workflow) => workflow.id === id)) merged.unshift(local)
+        }
         // Keep already-open tabs that still exist; on a fresh session open the
         // most recent workflow (the list arrives sorted by updatedAt desc).
         const openIds = s.openIds.length > 0
-          ? s.openIds.filter((id) => list.some((w) => w.id === id))
-          : (list.length > 0 ? [list[0].id] : [])
+          ? s.openIds.filter((id) => merged.some((w) => w.id === id))
+          : (merged.length > 0 ? [merged[0].id] : [])
         const activeId = s.activeId && openIds.includes(s.activeId) ? s.activeId : (openIds[0] ?? null)
         // Folders referenced by workflows always exist, even if localStorage was cleared
-        const folders = [...new Set([...s.folders, ...list.map((w) => w.folder).filter((f): f is string => !!f)])]
+        const folders = [...new Set([...s.folders, ...merged.map((w) => w.folder).filter((f): f is string => !!f)])]
         storeFolders(folders, s.folderColors, s.bookmarkedFolders)
-        return { workflows: list, loading: false, openIds, activeId, folders }
+        return { workflows: merged, loading: false, openIds, activeId, folders }
       })
     } catch {
       set({ loading: false })
@@ -210,15 +232,52 @@ export const useWorkflowsStore = create<WorkflowsStore>((set) => ({
   },
 
   async save(workflow) {
-    const result = await window.electron.workflows.save(workflow)
-    if (result.success) {
+    const previous = useWorkflowsStore.getState().workflows.find((item) => item.id === workflow.id)
+    if (!workflowSaveTails.has(workflow.id)) workflowSaveConfirmed.set(workflow.id, previous)
+    const revision = (workflowSaveRevisions.get(workflow.id) ?? 0) + 1
+    workflowSaveRevisions.set(workflow.id, revision)
+
+    // Update immediately: editors consume this store as their shared state, so
+    // waiting on a remote round trip would expose an obsolete graph to the next
+    // edit (most visibly while an image is being read and encoded).
+    set((s) => {
+      const idx = s.workflows.findIndex((item) => item.id === workflow.id)
+      if (idx === -1) return { workflows: [workflow, ...s.workflows] }
+      const next = [...s.workflows]
+      next[idx] = workflow
+      return { workflows: next }
+    })
+
+    const previousTail = workflowSaveTails.get(workflow.id) ?? Promise.resolve()
+    const operation = previousTail
+      .catch(() => undefined)
+      .then(() => window.electron.workflows.save(workflow))
+    const tail = operation.then(() => undefined, () => undefined)
+    workflowSaveTails.set(workflow.id, tail)
+
+    let result: { success: boolean; error?: string }
+    try {
+      result = await operation
+    } catch (error) {
+      result = { success: false, error: String(error) }
+    }
+
+    if (result.success) workflowSaveConfirmed.set(workflow.id, workflow)
+    if (!result.success && workflowSaveRevisions.get(workflow.id) === revision) {
+      const confirmed = workflowSaveConfirmed.get(workflow.id)
       set((s) => {
-        const idx = s.workflows.findIndex((w) => w.id === workflow.id)
-        if (idx === -1) return { workflows: [workflow, ...s.workflows] }
-        const next = [...s.workflows]
-        next[idx] = workflow
-        return { workflows: next }
+        const index = s.workflows.findIndex((item) => item.id === workflow.id)
+        if (!confirmed) return { workflows: s.workflows.filter((item) => item.id !== workflow.id) }
+        if (index === -1) return { workflows: [confirmed, ...s.workflows] }
+        const workflows = [...s.workflows]
+        workflows[index] = confirmed
+        return { workflows }
       })
+    }
+    if (workflowSaveTails.get(workflow.id) === tail) {
+      workflowSaveTails.delete(workflow.id)
+      workflowSaveConfirmed.delete(workflow.id)
+      if (workflowSaveRevisions.get(workflow.id) === revision) workflowSaveRevisions.delete(workflow.id)
     }
     return result
   },

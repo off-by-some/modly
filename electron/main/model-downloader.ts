@@ -17,6 +17,7 @@ export interface DownloadProgress {
   bytesDownloaded?: number
   totalBytes?: number
   stalledSeconds?: number
+  logs?: string[]
 }
 export type ProgressCallback = (progress: DownloadProgress) => void
 

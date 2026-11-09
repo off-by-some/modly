@@ -130,7 +130,7 @@ export default function ModelsPage(): JSX.Element {
     window.electron.model.onWeightsChanged(() => {
       void refreshInstalledIds(useExtensionsStore.getState().modelExtensions)
     })
-    window.electron.model.onProgress(({ modelId: id, variantId, percent, file, fileIndex, totalFiles, status, bytesDownloaded, totalBytes, stalledSeconds, paused, cancelled }) => {
+    window.electron.model.onProgress(({ modelId: id, variantId, percent, file, fileIndex, totalFiles, status, bytesDownloaded, totalBytes, stalledSeconds, logs, paused, cancelled }) => {
       if (cancelled) {
         setDownloading((prev) => { const n = { ...prev }; delete n[id]; return n })
         return
@@ -148,6 +148,11 @@ export default function ModelsPage(): JSX.Element {
             bytesDownloaded: bytesDownloaded ?? current?.bytesDownloaded,
             totalBytes: totalBytes ?? current?.totalBytes,
             stalledSeconds: stalledSeconds ?? current?.stalledSeconds,
+            logs: logs ?? (
+              status && status !== current?.status
+                ? [...(current?.logs ?? []), status].slice(-100)
+                : current?.logs
+            ),
             paused,
             variantId: variantId ?? current?.variantId,
           },

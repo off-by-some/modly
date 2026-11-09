@@ -102,6 +102,61 @@ test('save does not touch state when the bridge reports failure', async () => {
   assert.deepEqual(useStore.getState().workflows.map((w) => w.id), ['a'])
 })
 
+test('save is optimistic and serializes overlapping writes for one workflow', async () => {
+  const useStore = loadStore()
+  const calls = []
+  const releases = []
+  stubBridge({
+    save: (workflow) => {
+      calls.push(workflow.name)
+      return new Promise((resolve) => releases.push(() => resolve({ success: true })))
+    },
+  })
+  useStore.setState({ workflows: [migrated('a', { name: 'OLD' })] })
+
+  const first = useStore.getState().save(migrated('a', { name: 'FIRST', updatedAt: '1' }))
+  const second = useStore.getState().save(migrated('a', { name: 'SECOND', updatedAt: '2' }))
+
+  assert.equal(useStore.getState().workflows[0].name, 'SECOND')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(calls, ['FIRST'])
+
+  releases.shift()()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(calls, ['FIRST', 'SECOND'])
+  releases.shift()()
+  await Promise.all([first, second])
+  assert.equal(useStore.getState().workflows[0].name, 'SECOND')
+})
+
+test('load preserves an optimistic workflow while its save is in flight', async () => {
+  const useStore = loadStore()
+  let finishSave
+  stubBridge({
+    save: () => new Promise((resolve) => { finishSave = resolve }),
+    list: async () => [migrated('a', { name: 'STALE', updatedAt: '1' })],
+  })
+  useStore.setState({ workflows: [migrated('a', { name: 'OLD', updatedAt: '1' })] })
+
+  const saving = useStore.getState().save(migrated('a', { name: 'LOCAL', updatedAt: '2' }))
+  await useStore.getState().load()
+
+  assert.equal(useStore.getState().workflows[0].name, 'LOCAL')
+  finishSave({ success: true })
+  await saving
+})
+
+test('the latest failed save rolls its optimistic workflow back', async () => {
+  const useStore = loadStore()
+  stubBridge({ save: async () => ({ success: false, error: 'offline' }) })
+  useStore.setState({ workflows: [migrated('a', { name: 'OLD' })] })
+
+  const saving = useStore.getState().save(migrated('a', { name: 'LOCAL' }))
+  assert.equal(useStore.getState().workflows[0].name, 'LOCAL')
+  await saving
+  assert.equal(useStore.getState().workflows[0].name, 'OLD')
+})
+
 // ─── remove(): filter + active reset ────────────────────────────────────────────
 
 test('remove drops the workflow and clears activeId when it was the active one', async () => {

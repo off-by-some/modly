@@ -77,6 +77,7 @@ class MultiSourceRouterTests(unittest.TestCase):
     def tearDown(self) -> None:
         model_router.registry_module.MODELS_DIR = self.old_models_dir
         model_router._download_controls.clear()
+        model_router._managed_download_controls.clear()
         if self.old_hf_module is None:
             sys.modules.pop("huggingface_hub", None)
         else:
@@ -200,6 +201,56 @@ class MultiSourceRouterTests(unittest.TestCase):
         self.assertTrue(
             (self.models_dir / "pixal3d/_shared/base/main.bin").is_file()
         )
+
+    def test_managed_download_exposes_live_bytes_percent_and_server_log(self) -> None:
+        calls: list[str] = []
+        self.install_hf_stub({"org/main": ["weights.bin"]}, calls)
+        release = threading.Event()
+
+        def fake_download(**kwargs):
+            kwargs["progress_cb"]({
+                "percent": 0,
+                "status": "Downloading… 25%",
+                "bytesDownloaded": 25,
+                "totalBytes": 100,
+                "stalledSeconds": 0,
+            })
+            release.wait(2)
+            target = Path(kwargs["dest_dir"]) / kwargs["filename"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"x" * 100)
+            return 100
+
+        async def run():
+            with (
+                patch.object(model_router.generator_registry, "get_manifest", return_value={
+                    "id": "pixal3d",
+                    "hf_repo": "org/main",
+                }),
+                patch.object(model_router, "_download_file_streamed", fake_download),
+            ):
+                task = asyncio.create_task(model_router.managed_download("pixal3d/generate"))
+                for _ in range(100):
+                    active = await model_router.managed_downloads()
+                    if active and active[0]["bytesDownloaded"] == 25:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("managed download did not expose live progress")
+                release.set()
+                result = await task
+                return active[0], result
+
+        active, result = asyncio.run(run())
+
+        self.assertEqual(active["percent"], 25)
+        self.assertEqual(active["bytesDownloaded"], 25)
+        self.assertEqual(active["totalBytes"], 100)
+        self.assertEqual(active["file"], "weights.bin")
+        self.assertIn("Downloading weights.bin (1/1)", active["logs"])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["progress"]["percent"], 100)
+        self.assertEqual(result["progress"]["logs"][-1], "Download complete")
 
     def test_rejects_a_check_filtered_out_of_the_source_plan(self) -> None:
         calls: list[str] = []

@@ -164,8 +164,15 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       deleteWeightVariant: (modelId: string, variantId: string) => ipcRenderer.invoke('model:deleteWeightVariant', modelId, variantId),
       unloadAll:      () => ipcRenderer.invoke('model:unloadAll'),
       showInFolder:   (modelId: string) => ipcRenderer.invoke('model:showInFolder', modelId),
-      activeDownloads: (): Promise<{ modelId: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]> =>
-        ipcRenderer.invoke('model:activeDownloads') as Promise<{ modelId: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>,
+      activeDownloads: (): Promise<{
+        modelId: string; variantId?: string; percent: number; file?: string
+        fileIndex?: number; totalFiles?: number; status?: string
+        bytesDownloaded?: number; totalBytes?: number; stalledSeconds?: number; logs?: string[]
+      }[]> => ipcRenderer.invoke('model:activeDownloads') as Promise<{
+        modelId: string; variantId?: string; percent: number; file?: string
+        fileIndex?: number; totalFiles?: number; status?: string
+        bytesDownloaded?: number; totalBytes?: number; stalledSeconds?: number; logs?: string[]
+      }[]>,
       onProgress:     (cb: (data: {
         modelId: string
         percent: number
@@ -176,6 +183,7 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         bytesDownloaded?: number
         totalBytes?: number
         stalledSeconds?: number
+        logs?: string[]
         paused?: boolean
         cancelled?: boolean
       }) => void) => {
@@ -189,6 +197,7 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
           bytesDownloaded?: number
           totalBytes?: number
           stalledSeconds?: number
+          logs?: string[]
           paused?: boolean
           cancelled?: boolean
         }))

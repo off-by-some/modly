@@ -238,7 +238,19 @@ declare global {
       model: {
         export:         (args: { outputUrl: string; format: string }) => Promise<{ success: boolean; error?: string }>
         listDownloaded: () => Promise<{ id: string; name: string; size_gb: number }[]>
-        activeDownloads: () => Promise<{ modelId: string; variantId?: string; percent: number; file?: string; fileIndex?: number; totalFiles?: number }[]>
+        activeDownloads: () => Promise<{
+          modelId: string
+          variantId?: string
+          percent: number
+          file?: string
+          fileIndex?: number
+          totalFiles?: number
+          status?: string
+          bytesDownloaded?: number
+          totalBytes?: number
+          stalledSeconds?: number
+          logs?: string[]
+        }[]>
         isDownloaded:   (modelId: string) => Promise<boolean>
         hasLocalData:    (modelId: string) => Promise<boolean>
         sharedGroups:    (extensionId: string) => Promise<SharedWeightGroupState[]>
@@ -264,6 +276,7 @@ declare global {
           bytesDownloaded?: number
           totalBytes?: number
           stalledSeconds?: number
+          logs?: string[]
           paused?: boolean
           cancelled?: boolean
         }) => void) => void

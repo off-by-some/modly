@@ -795,20 +795,58 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ) => {
     if (isRemoteBackend()) {
       try {
-        event.sender.send('model:downloadProgress', { modelId, variantId: requestedVariantId ?? undefined, percent: 1, status: 'Downloading on server…' })
-        const { data } = await axios.post(`${selectedApiUrl()}/model/managed-download`, null, {
-          params: { model_id: modelId, variant_id: requestedVariantId ?? undefined },
-          timeout: 0,
+        const variantId = requestedVariantId ?? undefined
+        const apiUrl = selectedApiUrl()
+        event.sender.send('model:downloadProgress', {
+          modelId,
+          variantId,
+          percent: 0,
+          status: 'Preparing server download…',
+          logs: ['Preparing server download'],
         })
-        if (data?.paused) {
-          event.sender.send('model:downloadProgress', { modelId, variantId: requestedVariantId ?? undefined, percent: 1, status: 'paused', paused: true })
+        type ManagedDownloadResponse = {
+          paused?: boolean
+          cancelled?: boolean
+          progress?: DownloadProgress & { logs?: string[] }
+        }
+        const requestState: {
+          settled: boolean
+          error: unknown
+          data: ManagedDownloadResponse | null
+        } = { settled: false, error: null, data: null }
+        const request = axios.post(`${apiUrl}/model/managed-download`, null, {
+          params: { model_id: modelId, variant_id: variantId },
+          timeout: 0,
+        }).then((response) => { requestState.data = response.data }).catch((error) => { requestState.error = error }).finally(() => { requestState.settled = true })
+
+        while (!requestState.settled) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          try {
+            const response = await axios.get<Array<DownloadProgress & {
+              modelId: string
+              variantId?: string
+              logs?: string[]
+            }>>(`${apiUrl}/model/managed-downloads`, { timeout: 5_000 })
+            const progress = response.data.find((candidate) => candidate.modelId === modelId)
+            if (progress) event.sender.send('model:downloadProgress', progress)
+          } catch {
+            // The blocking download request remains authoritative. A transient
+            // status-poll failure must not cancel a server-owned download.
+          }
+        }
+        await request
+        if (requestState.error) throw requestState.error
+        const responseData = requestState.data
+        if (responseData?.progress) event.sender.send('model:downloadProgress', { modelId, variantId, ...responseData.progress })
+        if (responseData?.paused) {
+          event.sender.send('model:downloadProgress', { modelId, variantId, percent: responseData.progress?.percent ?? 0, status: 'paused', paused: true })
           return { success: false, paused: true }
         }
-        if (data?.cancelled) {
-          event.sender.send('model:downloadProgress', { modelId, variantId: requestedVariantId ?? undefined, percent: 0, status: 'cancelled', cancelled: true })
+        if (responseData?.cancelled) {
+          event.sender.send('model:downloadProgress', { modelId, variantId, percent: 0, status: 'cancelled', cancelled: true })
           return { success: false, cancelled: true }
         }
-        event.sender.send('model:downloadProgress', { modelId, variantId: requestedVariantId ?? undefined, percent: 100, status: 'done' })
+        event.sender.send('model:downloadProgress', { modelId, variantId, percent: 100, status: 'done', logs: responseData?.progress?.logs })
         notifyWeightChange()
         return { success: true }
       } catch (err) {
@@ -1815,7 +1853,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const win    = getWindow()
     const emit   = (data: object) => win?.webContents.send('extensions:installProgress', data)
     if (isRemoteBackend()) {
-      let serverError: { message: string; details?: string } | null = null
+      const installState: {
+        result: Record<string, unknown> | null
+        serverError: { message: string; details?: string } | null
+      } = { result: null, serverError: null }
       try {
         const response = await axios.post<NodeJS.ReadableStream>(
           `${selectedApiUrl()}/extensions/install-github`,
@@ -1828,16 +1869,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         )
         const installId = String(response.headers['x-modly-install-id'] ?? '')
         let buffer = ''
-        let result: Record<string, unknown> | null = null
         let lastEvent = ''
         const acceptEvent = (installEvent: Record<string, unknown>) => {
           const fingerprint = JSON.stringify(installEvent)
           if (fingerprint === lastEvent) return
           lastEvent = fingerprint
-          if (installEvent.step === 'result') result = installEvent
+          if (installEvent.step === 'result') installState.result = installEvent
           else {
             if (installEvent.step === 'error') {
-              serverError = {
+              installState.serverError = {
                 message: String(installEvent.message ?? 'Extension installation failed'),
                 details: typeof installEvent.details === 'string' ? installEvent.details : undefined,
               }
@@ -1870,9 +1910,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         // The server owns the transaction after it starts. If a long wheel
         // download outlives the SSE socket, recover its latest/terminal state
         // instead of reporting a false failure while setup continues remotely.
-        if (!result && !serverError && installId) {
+        if (!installState.result && !installState.serverError && installId) {
           let consecutiveFailures = 0
-          for (let attempt = 0; attempt < 1800 && !result && !serverError; attempt += 1) {
+          for (let attempt = 0; attempt < 1800 && !installState.result && !installState.serverError; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 2_000))
             try {
               const status = await axios.get<{
@@ -1896,17 +1936,17 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
             }
           }
         }
-        if (serverError) throw new Error(serverError.message)
-        if (!result || result.success !== true) {
+        if (installState.serverError) throw new Error(installState.serverError.message)
+        if (!installState.result || installState.result.success !== true) {
           throw streamFailure ?? new Error('The server ended the install without a result')
         }
-        emit({ step: 'done', extensionId: result.extensionId })
-        return result
+        emit({ step: 'done', extensionId: installState.result.extensionId })
+        return installState.result
       } catch (err) {
-        const error = serverError?.message ?? (
+        const error = installState.serverError?.message ?? (
           axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err)
         )
-        if (!serverError) emit({ step: 'error', message: error })
+        if (!installState.serverError) emit({ step: 'error', message: error })
         return { success: false, error }
       }
     }

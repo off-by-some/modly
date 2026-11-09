@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { AnyExtension, ExtensionNode, SharedWeightGroupState } from '@shared/types/electron.d'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { useNavStore } from '@shared/stores/navStore'
+import { useAppStore } from '@shared/stores/appStore'
 import {
   DownloadMap,
   ICONS,
@@ -42,6 +43,7 @@ export function ExtensionDrawer({
   onUninstallNode, onDeleteSharedGroup, onDeleteWeightVariant, onUninstall, onRepaired, onSynced, onClose,
 }: Props): JSX.Element {
   const navigate = useNavStore((s) => s.navigate)
+  const backendMode = useAppStore((s) => s.backendMode)
   const installedWeightVariants = useExtensionsStore((s) => s.installedWeightVariants)
   const [repairing,   setRepairing]   = useState(false)
   const [repairError, setRepairError] = useState<string | null>(null)
@@ -367,6 +369,17 @@ export function ExtensionDrawer({
                             <span className="text-amber-400 shrink-0">No progress {dl.stalledSeconds}s</span>
                           )}
                         </div>
+                        {dl.logs && dl.logs.length > 0 && (
+                          <div className="mt-1.5 overflow-hidden rounded-md border border-zinc-800 bg-black/30">
+                            <div className="flex items-center justify-between border-b border-zinc-800 px-2 py-1 text-[9px] uppercase tracking-[0.1em] text-zinc-600">
+                              <span>{backendMode === 'remote' ? 'Server log' : 'Download log'}</span>
+                              <span className="normal-case tracking-normal">Live</span>
+                            </div>
+                            <pre className="max-h-28 overflow-auto whitespace-pre-wrap break-words px-2 py-1.5 font-mono text-[9.5px] leading-4 text-zinc-500 select-text">
+                              {dl.logs.slice(-8).join('\n')}
+                            </pre>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
