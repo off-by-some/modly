@@ -58,6 +58,11 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
     },
 
     // Python / FastAPI bridge
+    backend: {
+      select: (apiUrl: string): Promise<{ apiUrl: string }> =>
+        ipcRenderer.invoke('backend:select', apiUrl) as Promise<{ apiUrl: string }>,
+    },
+
     python: {
       start:     (): Promise<{ success: boolean; port?: number; error?: string }> =>
         ipcRenderer.invoke('python:start') as Promise<{ success: boolean; port?: number; error?: string }>,
@@ -111,9 +116,9 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
       decrypt: (stored: string): Promise<string | null> => ipcRenderer.invoke('secure:decrypt', stored) as Promise<string | null>,
     },
 
-    // Agent — local LLM models
+    // Agent — LLM models managed by the selected server
     agent: {
-      // Opens a file picker and copies the chosen .gguf into the agent's models folder.
+      // Opens a local picker and copies/uploads the chosen .gguf to the selected server.
       addModel: (): Promise<{ success: boolean; cancelled?: boolean; fileName?: string; error?: string }> =>
         ipcRenderer.invoke('agent:addModel') as Promise<{ success: boolean; cancelled?: boolean; fileName?: string; error?: string }>,
     },
@@ -225,6 +230,8 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         ipcRenderer.invoke('workspace:saveJobMeta', { collection, filename, meta }) as Promise<void>,
       deleteJob: (collection: string, filename: string): Promise<void> =>
         ipcRenderer.invoke('workspace:deleteJob', { collection, filename }) as Promise<void>,
+      stageFile: (filePath: string): Promise<string> =>
+        ipcRenderer.invoke('workspace:stageFile', filePath) as Promise<string>,
       library: {
         list: (): Promise<AssetLibraryListResult> => ipcRenderer.invoke('workspace:library:list') as Promise<AssetLibraryListResult>,
         read: (request: AssetLibraryReadRequest): Promise<AssetLibraryReadResult> => ipcRenderer.invoke('workspace:library:read', request) as Promise<AssetLibraryReadResult>,

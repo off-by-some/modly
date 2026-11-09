@@ -189,6 +189,9 @@ declare global {
       ui: {
         setZoomFactor: (factor: number) => void
       }
+      backend: {
+        select: (apiUrl: string) => Promise<{ apiUrl: string }>
+      }
       python: {
         start:     () => Promise<{ success: boolean; port?: number; error?: string }>
         status:    () => Promise<{ ready: boolean; apiUrl: string }>
@@ -222,7 +225,7 @@ declare global {
         decrypt: (stored: string) => Promise<string | null>
       }
       agent: {
-        /** Opens a file picker and copies the chosen .gguf into the agent's models folder. */
+        /** Opens a local picker and copies/uploads the chosen .gguf to the selected server. */
         addModel: () => Promise<{ success: boolean; cancelled?: boolean; fileName?: string; error?: string }>
       }
       cache: {
@@ -293,6 +296,7 @@ declare global {
         listJobs: (collection: string) => Promise<unknown[]>
         saveJobMeta: (collection: string, filename: string, meta: unknown) => Promise<void>
         deleteJob: (collection: string, filename: string) => Promise<void>
+        stageFile: (filePath: string) => Promise<string>
         library: {
           list: () => Promise<AssetLibraryListResult>
           read: (request: AssetLibraryReadRequest) => Promise<AssetLibraryReadResult>

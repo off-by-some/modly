@@ -5,10 +5,11 @@ Reuses the streamed/resumable downloader from routers.model.
 import asyncio
 import json
 import threading
+from urllib.parse import unquote
 from pathlib import Path
 from typing import Optional
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -114,6 +115,40 @@ async def set_config(request: LlmConfigRequest):
 async def unload():
     await asyncio.to_thread(llama_pool.unload_all)
     return {"unloaded": True}
+
+
+@router.post("/models/upload")
+async def upload_model(request: Request, x_modly_filename: str = Header(...)):
+    """Stream a client-selected GGUF into this server's managed model folder."""
+    file_name = Path(unquote(x_modly_filename)).name
+    if not file_name.lower().endswith(".gguf") or file_name in {"", ".gguf"}:
+        raise HTTPException(status_code=422, detail="Only .gguf files can be added")
+
+    root = llm_server.LLM_MODELS_DIR.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    destination = (root / file_name).resolve()
+    if destination.parent != root:
+        raise HTTPException(status_code=422, detail="Invalid model filename")
+    if destination.exists():
+        raise HTTPException(status_code=409, detail=f'"{file_name}" is already in this server\'s models')
+
+    partial = destination.with_name(f".{destination.name}.uploading")
+    if partial.exists():
+        raise HTTPException(status_code=409, detail=f'An upload for "{file_name}" is already in progress')
+
+    try:
+        with partial.open("xb") as output:
+            async for chunk in request.stream():
+                if chunk:
+                    output.write(chunk)
+        partial.replace(destination)
+    except HTTPException:
+        partial.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        partial.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Could not store model: {exc}")
+    return {"success": True, "file_name": file_name}
 
 
 @router.delete("/models/{model_id}")

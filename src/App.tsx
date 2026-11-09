@@ -5,6 +5,7 @@ import MainLayout from '@shared/components/layout/MainLayout'
 import { UpdateModal } from '@shared/components/ui/UpdateModal'
 import { ErrorModal } from '@shared/components/ui/ErrorModal'
 import { Toast } from '@shared/components/ui/Toast'
+import { BackendConnectionMonitor } from '@shared/components/BackendConnectionMonitor'
 
 const UI_SCALE_FACTORS: Record<UiScale, number> = { small: 0.875, medium: 1, large: 1.25, 'very-large': 1.5 }
 
@@ -59,6 +60,7 @@ export default function App(): JSX.Element {
       )}
       <Toast />
       <ErrorModal />
+      <BackendConnectionMonitor />
     </>
   )
   return (

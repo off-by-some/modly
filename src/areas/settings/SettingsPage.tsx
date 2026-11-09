@@ -6,8 +6,9 @@ import { IntegrationsSection } from './components/IntegrationsSection'
 import { AgentSection } from './components/AgentSection'
 import { ApplicationSection } from './components/ApplicationSection'
 import { AccessibilitySection } from './components/AccessibilitySection'
+import { BackendSection } from './components/BackendSection'
 
-type Section = 'application' | 'storage' | 'integrations' | 'accessibility' | 'agent' | 'logs' | 'about'
+type Section = 'application' | 'backend' | 'storage' | 'integrations' | 'accessibility' | 'agent' | 'logs' | 'about'
 
 const SECTIONS: { id: Section; label: string; icon: JSX.Element }[] = [
   {
@@ -18,6 +19,18 @@ const SECTIONS: { id: Section; label: string; icon: JSX.Element }[] = [
         <circle cx="12" cy="12" r="3" />
         <path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14" />
         <path d="M15.54 8.46a5 5 0 0 1 0 7.07M8.46 8.46a5 5 0 0 0 0 7.07" />
+      </svg>
+    )
+  },
+  {
+    id: 'backend',
+    label: 'Backend',
+    icon: (
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <rect x="3" y="3" width="18" height="7" rx="2" />
+        <rect x="3" y="14" width="18" height="7" rx="2" />
+        <circle cx="7" cy="6.5" r="0.75" fill="currentColor" stroke="none" />
+        <circle cx="7" cy="17.5" r="0.75" fill="currentColor" stroke="none" />
       </svg>
     )
   },
@@ -122,6 +135,7 @@ export default function SettingsPage(): JSX.Element {
       <div className="flex-1 overflow-y-auto bg-surface-400">
         <div className="p-8">
           {section === 'application'   && <ApplicationSection />}
+          {section === 'backend'       && <BackendSection />}
           {section === 'storage'       && <StorageSection />}
           {section === 'integrations'  && <IntegrationsSection />}
           {section === 'accessibility' && <AccessibilitySection />}

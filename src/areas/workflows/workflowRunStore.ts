@@ -134,6 +134,7 @@ interface RunContext {
   allExtensions:      WorkflowExtension[]
   client:             AxiosInstance
   workspaceDir:       string
+  remoteBackend:      boolean
   selectedImagePath:  string | undefined
   selectedImageData?: string
   overrideImageData?: string
@@ -304,7 +305,7 @@ async function executeExtensionNode(
     return
   }
 
-  const { workflow, allExtensions, client, workspaceDir, nodeOutputs, nodeMap,
+  const { workflow, allExtensions, client, workspaceDir, remoteBackend, nodeOutputs, nodeMap,
           selectedImagePath, selectedImageData } = ctx
 
   const ext = getWorkflowExtension(node.data.extensionId ?? '', allExtensions)
@@ -395,7 +396,10 @@ async function executeExtensionNode(
 
     const extraParams: Record<string, unknown> = {}
     if (nodeInputMeshPath) {
-      const norm = nodeInputMeshPath.replace(/\\/g, '/')
+      const stagedMeshPath = remoteBackend
+        ? await window.electron.workspace.stageFile(nodeInputMeshPath)
+        : nodeInputMeshPath
+      const norm = stagedMeshPath.replace(/\\/g, '/')
       extraParams.mesh_path = norm.startsWith(workspaceDir)
         ? norm.slice(workspaceDir.length).replace(/^\//, '')
         : norm
@@ -405,7 +409,9 @@ async function executeExtensionNode(
       extraParams.text   = nodeInputText
     }
     if (extraImagePaths.length > 0) {
-      extraParams.extra_image_paths = extraImagePaths
+      extraParams.extra_image_paths = remoteBackend
+        ? await Promise.all(extraImagePaths.map((path) => window.electron.workspace.stageFile(path)))
+        : extraImagePaths
     }
 
     const schemaDefaults = Object.fromEntries(
@@ -833,7 +839,7 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
         }
 
         const ctx: RunContext = {
-          workflow, allExtensions, client, workspaceDir, selectedImagePath, selectedImageData,
+          workflow, allExtensions, client, workspaceDir, remoteBackend: appState.backendMode === 'remote', selectedImagePath, selectedImageData,
           overrideImageData, nodeOutputs, nodeMap, ordered, branches, waitIds, parentWait, iteratorFiles,
         }
         _ctx.current = ctx

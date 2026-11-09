@@ -6,6 +6,7 @@ import { existsSync, readdirSync, statSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { getHfToken } from './hf-token'
 import type { ModelSource } from './model-sources'
+import { getSelectedApiUrl } from './backend-target'
 
 export interface DownloadProgress {
   percent: number
@@ -18,8 +19,6 @@ export interface DownloadProgress {
   stalledSeconds?: number
 }
 export type ProgressCallback = (progress: DownloadProgress) => void
-
-const PYTHON_API_URL = process.env['PYTHON_API_URL'] ?? 'http://127.0.0.1:8765'
 
 // ------------------------------------------------------------------
 // Public API
@@ -121,7 +120,7 @@ export async function downloadModelFromHF(
   includePrefixes?: string[],
 ): Promise<void> {
   const { net } = require('electron')
-  let url = `${PYTHON_API_URL}/model/hf-download?repo_id=${encodeURIComponent(repoId)}&model_id=${encodeURIComponent(modelId)}`
+  let url = `${getSelectedApiUrl()}/model/hf-download?repo_id=${encodeURIComponent(repoId)}&model_id=${encodeURIComponent(modelId)}`
   if (skipPrefixes && skipPrefixes.length > 0) {
     url += `&skip_prefixes=${encodeURIComponent(JSON.stringify(skipPrefixes))}`
   }
@@ -147,7 +146,7 @@ export async function downloadModelSourcesFromHF(
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const hfToken = getHfToken()
   if (hfToken) headers.Authorization = `Bearer ${hfToken}`
-  const url = `${PYTHON_API_URL}/model/hf-download-sources?model_id=${encodeURIComponent(modelId)}`
+  const url = `${getSelectedApiUrl()}/model/hf-download-sources?model_id=${encodeURIComponent(modelId)}`
   const res = await net.fetch(url, {
     method: 'POST',
     headers,

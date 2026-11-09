@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 import services.generator_registry as reg_module
+from routers import server as server_router
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -13,6 +14,8 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 class PathsUpdate(BaseModel):
     models_dir:    Optional[str] = None
     workspace_dir: Optional[str] = None
+    workflows_dir: Optional[str] = None
+    extensions_dir: Optional[str] = None
 
 
 class TokenUpdate(BaseModel):
@@ -24,6 +27,8 @@ async def get_paths():
     return {
         "models_dir":    str(reg_module.MODELS_DIR),
         "workspace_dir": str(reg_module.WORKSPACE_DIR),
+        "workflows_dir": str(server_router.WORKFLOWS_DIR),
+        "extensions_dir": str(reg_module.EXTENSIONS_DIR or ""),
     }
 
 
@@ -35,9 +40,18 @@ async def update_paths(body: PathsUpdate):
         Path(body.models_dir)    if body.models_dir    else None,
         Path(body.workspace_dir) if body.workspace_dir else None,
     )
+    if body.workflows_dir:
+        server_router.WORKFLOWS_DIR = Path(body.workflows_dir)
+        server_router.WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    if body.extensions_dir:
+        reg_module.EXTENSIONS_DIR = Path(body.extensions_dir)
+        reg_module.EXTENSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(reg_module.generator_registry.reload)
     return {
         "models_dir":    str(reg_module.MODELS_DIR),
         "workspace_dir": str(reg_module.WORKSPACE_DIR),
+        "workflows_dir": str(server_router.WORKFLOWS_DIR),
+        "extensions_dir": str(reg_module.EXTENSIONS_DIR or ""),
     }
 
 

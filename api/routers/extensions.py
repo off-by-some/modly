@@ -5,10 +5,308 @@ import platform as platform_module
 import re
 import subprocess
 import sys
+import shutil
+import tarfile
+import tempfile
+import uuid
 from pathlib import Path
+from urllib.parse import urlparse
+import httpx
 from fastapi import APIRouter, Body, HTTPException
+from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["extensions"])
+
+_SAFE_EXTENSION_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def _extension_root() -> Path:
+    from services.generator_registry import EXTENSIONS_DIR
+    if EXTENSIONS_DIR is None:
+        raise HTTPException(400, "EXTENSIONS_DIR not configured")
+    EXTENSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    return EXTENSIONS_DIR.resolve()
+
+
+def _extension_path(extension_id: str) -> Path:
+    if not _SAFE_EXTENSION_ID.fullmatch(extension_id):
+        raise HTTPException(400, "Invalid extension id")
+    root = _extension_root()
+    path = (root / extension_id).resolve()
+    if path.parent != root:
+        raise HTTPException(400, "Invalid extension path")
+    return path
+
+
+def _node_for_client(node: dict) -> dict:
+    variants = node.get("weight_variants")
+    if isinstance(variants, dict):
+        variants = {
+            "param": variants.get("param"),
+            "default": variants.get("default"),
+            "options": [
+                {
+                    "id": option.get("id"),
+                    "label": option.get("label", option.get("id")),
+                    "sizeGb": option.get("size_gb"),
+                    "vramGb": option.get("vram_gb"),
+                }
+                for option in variants.get("options", [])
+                if isinstance(option, dict)
+            ],
+        }
+    return {
+        "id": node.get("id", ""),
+        "name": node.get("name", node.get("id", "")),
+        "input": node.get("input", "image"),
+        "inputs": node.get("inputs"),
+        "inputLabels": node.get("input_labels"),
+        "output": node.get("output", "mesh"),
+        "paramsSchema": node.get("params_schema", []),
+        "paramDefaults": node.get("param_defaults"),
+        "hfRepo": node.get("hf_repo"),
+        "downloadCheck": node.get("download_check"),
+        "hfSkipPrefixes": node.get("hf_skip_prefixes"),
+        "hfIncludePrefixes": node.get("hf_include_prefixes"),
+        "hasModelSources": isinstance(node.get("model_sources"), list),
+        "weightGroups": node.get("weight_groups"),
+        "weightVariants": variants,
+    }
+
+
+def _manifest_for_client(manifest: dict, *, corrupted: bool = False) -> dict:
+    nodes = [
+        _node_for_client(node)
+        for node in manifest.get("nodes", [])
+        if isinstance(node, dict) and node.get("id")
+    ]
+    groups = []
+    for group in manifest.get("weight_groups", []) or []:
+        if not isinstance(group, dict) or not group.get("id"):
+            continue
+        dependent = [
+            node["id"] for node in manifest.get("nodes", [])
+            if isinstance(node, dict) and group["id"] in (node.get("weight_groups") or [])
+        ]
+        groups.append({"id": group["id"], "dependentNodeIds": dependent})
+    return {
+        "type": manifest.get("type", "model"),
+        "id": manifest.get("id", ""),
+        "name": manifest.get("name", manifest.get("id", "")),
+        "version": manifest.get("version"),
+        "description": manifest.get("description"),
+        "author": manifest.get("author"),
+        "source": manifest.get("source"),
+        "entry": manifest.get("entry", ""),
+        "trusted": False,
+        "builtin": bool(manifest.get("builtin", False)),
+        "nodes": nodes,
+        "weightGroups": groups or None,
+        "corrupted": corrupted,
+    }
+
+
+@router.get("/list")
+async def list_extensions():
+    result = []
+    for path in sorted(_extension_root().iterdir()):
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        manifest_path = path / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest must be an object")
+            result.append(_manifest_for_client(manifest))
+        except Exception:
+            result.append({
+                "type": "model", "id": path.name, "name": path.name,
+                "trusted": False, "builtin": False, "nodes": [],
+                "corrupted": True,
+                "manifestError": "invalid" if manifest_path.exists() else "missing",
+            })
+    return result
+
+
+class GitHubInstall(BaseModel):
+    url: str
+
+
+class ProcessRun(BaseModel):
+    extension_id: str
+    input: dict = Field(default_factory=dict)
+    params: dict = Field(default_factory=dict)
+
+
+@router.post("/run-process")
+async def run_process(body: ProcessRun):
+    extension_dir = _extension_path(body.extension_id)
+    manifest_path = extension_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(400, "Extension manifest is unreadable") from exc
+    if manifest.get("type") != "process":
+        raise HTTPException(400, "Extension is not a process extension")
+    entry = manifest.get("entry")
+    if not isinstance(entry, str) or not entry:
+        raise HTTPException(400, "Process extension has no entry")
+    entry_path = (extension_dir / entry).resolve()
+    if extension_dir.resolve() not in entry_path.parents or not entry_path.is_file():
+        raise HTTPException(400, "Process extension entry is missing or unsafe")
+
+    import services.generator_registry as registry
+    workspace = registry.WORKSPACE_DIR
+    temp_dir = workspace / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({
+        "input": body.input,
+        "params": body.params,
+        "nodeId": body.input.get("nodeId", ""),
+        "workspaceDir": str(workspace),
+        "tempDir": str(temp_dir),
+    }) + "\n"
+    env = {
+        **os.environ,
+        "PYTHONUTF8": "1",
+        "MODLY_API_DIR": str(Path(__file__).resolve().parents[1]),
+        "MODLY_NODE_EXECUTABLE": os.environ.get("MODLY_NODE_EXECUTABLE", "node"),
+        "EXTENSION_DIR": str(extension_dir),
+        "WORKSPACE_DIR": str(workspace),
+        "TEMP_DIR": str(temp_dir),
+    }
+    if entry_path.suffix == ".py":
+        if sys.platform == "win32":
+            venv_python = extension_dir / ".venv" / "Scripts" / "python.exe"
+        else:
+            venv_python = extension_dir / ".venv" / "bin" / "python"
+        executable = str(venv_python if venv_python.is_file() else Path(sys.executable))
+        command = [executable, str(entry_path)]
+    else:
+        node = os.environ.get("MODLY_NODE_EXECUTABLE", "node")
+        command = [node, str(Path(__file__).resolve().parents[1] / "process_runner.cjs"), str(extension_dir), entry]
+    result = await asyncio.to_thread(
+        subprocess.run, command, input=payload, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=env, timeout=60 * 60,
+    )
+    messages = []
+    for line in result.stdout.splitlines():
+        try:
+            messages.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    done = next((message for message in reversed(messages) if message.get("type") == "done"), None)
+    error = next((message for message in reversed(messages) if message.get("type") == "error"), None)
+    if done is not None:
+        return {"success": True, "result": done.get("result") or {}}
+    message = error.get("message") if error else (result.stderr.strip() or f"Process exited with {result.returncode}")
+    raise HTTPException(500, message)
+
+
+def _extract_github_tarball(payload: bytes, destination: Path) -> None:
+    archive_path = destination.parent / f"{destination.name}.tar.gz"
+    archive_path.write_bytes(payload)
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            members = archive.getmembers()
+            roots = {member.name.split("/", 1)[0] for member in members if member.name}
+            if len(roots) != 1:
+                raise ValueError("GitHub archive has an unexpected layout")
+            root_name = next(iter(roots))
+            for member in members:
+                relative = member.name.removeprefix(root_name).lstrip("/")
+                if not relative:
+                    continue
+                target = (destination / relative).resolve()
+                if destination.resolve() not in target.parents:
+                    raise ValueError("Archive contains an unsafe path")
+                if member.issym() or member.islnk():
+                    raise ValueError("Archive links are not supported")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif member.isfile():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ValueError("Could not read archive member")
+                    with source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+
+@router.post("/install-github")
+async def install_from_github(body: GitHubInstall):
+    parsed = urlparse(body.url.strip())
+    parts = [part for part in parsed.path.split("/") if part]
+    if parsed.scheme != "https" or parsed.hostname != "github.com" or len(parts) < 2:
+        raise HTTPException(400, "Expected a GitHub repository URL")
+    owner, repo = parts[0], parts[1].removesuffix(".git")
+    tarball_url = f"https://api.github.com/repos/{owner}/{repo}/tarball/HEAD"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
+        response = await client.get(tarball_url, headers={"User-Agent": "Modly-Server"})
+        response.raise_for_status()
+
+    root = _extension_root()
+    staging = Path(tempfile.mkdtemp(prefix=".modly-install-", dir=root))
+    backup = None
+    destination = None
+    try:
+        _extract_github_tarball(response.content, staging)
+        manifest_path = staging / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest.json must contain an object")
+        extension_id = manifest.get("id")
+        if not isinstance(extension_id, str) or not _SAFE_EXTENSION_ID.fullmatch(extension_id):
+            raise ValueError("manifest.json contains an invalid extension id")
+        if not isinstance(manifest.get("nodes"), list) or not manifest["nodes"]:
+            raise ValueError("manifest.json must declare at least one node")
+        manifest["source"] = f"https://github.com/{owner}/{repo}"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        destination = _extension_path(extension_id)
+        backup = root / f".modly-backup-{extension_id}-{uuid.uuid4().hex}"
+        if destination.exists():
+            destination.rename(backup)
+        staging.rename(destination)
+        try:
+            if (destination / "setup.py").exists():
+                await setup_extension(extension_id)
+            elif manifest.get("type") == "process" and (destination / "package.json").exists():
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["npm", "install", "--omit=dev", "--no-audit", "--no-fund"],
+                    cwd=destination, capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr or "npm install failed")
+            from services.generator_registry import generator_registry
+            await asyncio.to_thread(generator_registry.reload)
+        except Exception:
+            shutil.rmtree(destination, ignore_errors=True)
+            if backup and backup.exists():
+                backup.rename(destination)
+            raise
+        if backup and backup.exists():
+            shutil.rmtree(backup)
+        return {"success": True, "extensionId": extension_id, "extension": _manifest_for_client(manifest)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+@router.delete("/{extension_id}")
+async def uninstall_extension(extension_id: str):
+    path = _extension_path(extension_id)
+    if path.exists():
+        shutil.rmtree(path)
+    from services.generator_registry import generator_registry
+    await asyncio.to_thread(generator_registry.reload)
+    return {"success": True}
 
 
 @router.post("/reload")

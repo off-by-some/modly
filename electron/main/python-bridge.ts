@@ -7,10 +7,11 @@ import { ensureAgentDir, getSettings } from './settings-store'
 import { getHfToken } from './hf-token'
 import { logger } from './logger'
 import { cleanPythonEnv, getVenvPythonExe } from './python-setup'
+import { LOCAL_API_URL } from './backend-target'
 
 const API_PORT = 8765
 const API_HOST = '127.0.0.1'
-export const API_BASE_URL = `http://${API_HOST}:${API_PORT}`
+export const API_BASE_URL = LOCAL_API_URL
 
 export class PythonBridge {
   private process: ChildProcess | null = null
@@ -64,6 +65,7 @@ export class PythonBridge {
         // No PYTHONPATH needed - the venv's Python has its own isolated site-packages
         MODELS_DIR:             this.resolveModelsDir(),
         WORKSPACE_DIR:          this.resolveWorkspaceDir(),
+        WORKFLOWS_DIR:          getSettings(app.getPath('userData')).workflowsDir,
         EXTENSIONS_DIR:         this.resolveExtensionsDir(),
         // llm_server.py keeps everything of the local LLM here: engine, GGUF models, logs, config.
         MODLY_LLM_DIR:          this.resolveAgentDir(),

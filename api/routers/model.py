@@ -4,6 +4,8 @@ import time
 import os
 import socket
 import threading
+import shutil
+import re
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -22,6 +24,277 @@ from services.model_sources import (
 )
 
 router = APIRouter(tags=["model"])
+
+_SAFE_MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _safe_model_parts(model_id: str) -> tuple[str, str]:
+    parts = model_id.split("/")
+    if len(parts) != 2 or not all(_SAFE_MODEL_PART.fullmatch(part) for part in parts):
+        raise HTTPException(400, "Model id must identify one safe extension node")
+    return parts[0], parts[1]
+
+
+def _model_root(model_id: str) -> Path:
+    extension_id, node_id = _safe_model_parts(model_id)
+    return registry_module.MODELS_DIR / extension_id / node_id
+
+
+def _storage_has_data(root: Path) -> bool:
+    return root.exists() and any(
+        path.is_file() and path.stat().st_size > 0 and ".cache" not in path.parts
+        for path in root.rglob("*")
+    )
+
+
+def _installed_variants(model_id: str, manifest: dict) -> list[str] | None:
+    variants = manifest.get("weight_variants")
+    if not isinstance(variants, dict):
+        return None
+    root = _model_root(model_id)
+    installed = []
+    for option in variants.get("options", []):
+        if not isinstance(option, dict) or not isinstance(option.get("id"), str):
+            continue
+        prefixes = option.get("include_prefixes") or []
+        files = [path for path in root.rglob("*") if path.is_file() and path.stat().st_size > 0]
+        if prefixes and all(any(
+            path.relative_to(root).as_posix().startswith(prefix)
+            for path in files
+        ) for prefix in prefixes):
+            installed.append(option["id"])
+    return installed
+
+
+@router.get("/storage/{model_id:path}/state")
+async def model_storage_state(model_id: str):
+    try:
+        manifest = generator_registry.get_manifest(model_id)
+    except KeyError as exc:
+        raise HTTPException(404, f"Unknown model ID: {model_id}") from exc
+    statuses = {item["id"]: item for item in generator_registry.all_status()}
+    return {
+        "downloaded": bool(statuses.get(model_id, {}).get("downloaded", False)),
+        "hasLocalData": _storage_has_data(_model_root(model_id)),
+        "installedWeightVariants": _installed_variants(model_id, manifest),
+    }
+
+
+@router.get("/storage/extensions/{extension_id}/shared-groups")
+async def shared_group_states(extension_id: str):
+    if not _SAFE_MODEL_PART.fullmatch(extension_id):
+        raise HTTPException(400, "Invalid extension id")
+    groups: dict[str, dict] = {}
+    for model_id, manifest in generator_registry._manifests.items():
+        if not model_id.startswith(f"{extension_id}/"):
+            continue
+        for group in manifest.get("weight_groups", []) or []:
+            if not isinstance(group, dict) or not isinstance(group.get("id"), str):
+                continue
+            entry = groups.setdefault(group["id"], {"group": group, "dependents": []})
+            entry["dependents"].append(model_id)
+    result = []
+    for group_id, entry in groups.items():
+        target_id = f"{extension_id}/_shared/{group_id}"
+        root = registry_module.MODELS_DIR / extension_id / "_shared" / group_id
+        checks = [
+            check
+            for source in entry["group"].get("model_sources", [])
+            for check in source.get("checks", [])
+        ]
+        result.append({
+            "id": group_id,
+            "targetId": target_id,
+            "dependentModelIds": entry["dependents"],
+            "downloaded": bool(checks) and all((root / check).is_file() for check in checks),
+            "hasLocalData": _storage_has_data(root),
+        })
+    return result
+
+
+def _snapshot_source(source: dict, destination: Path, token: str | None) -> None:
+    from huggingface_hub import snapshot_download
+    destination.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=source["repo_id"],
+        revision=source.get("revision"),
+        local_dir=destination,
+        allow_patterns=source.get("include_prefixes") or None,
+        ignore_patterns=source.get("skip_prefixes") or None,
+        token=token,
+    )
+
+
+class ManagedDownloadPaused(Exception):
+    pass
+
+
+class ManagedDownloadCancelled(Exception):
+    pass
+
+
+_managed_download_controls: dict[str, dict[str, threading.Event]] = {}
+
+
+def _check_managed_download(control: dict[str, threading.Event]) -> None:
+    if control["cancel"].is_set():
+        raise ManagedDownloadCancelled()
+    if control["pause"].is_set():
+        raise ManagedDownloadPaused()
+
+
+@router.post("/managed-download")
+async def managed_download(model_id: str, variant_id: str | None = None):
+    try:
+        manifest = generator_registry.get_manifest(model_id)
+    except KeyError as exc:
+        raise HTTPException(404, f"Unknown model ID: {model_id}") from exc
+    extension_id, _ = _safe_model_parts(model_id)
+    token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
+    root = _model_root(model_id)
+    if model_id in _managed_download_controls:
+        raise HTTPException(409, "Download already in progress")
+    control = {"pause": threading.Event(), "cancel": threading.Event()}
+    _managed_download_controls[model_id] = control
+
+    def download() -> None:
+        for group in manifest.get("weight_groups", []) or []:
+            group_root = registry_module.MODELS_DIR / extension_id / "_shared" / group["id"]
+            for source in group.get("model_sources", []) or []:
+                _check_managed_download(control)
+                destination = group_root / source.get("destination", ".")
+                _snapshot_source(source, destination, token)
+                _check_managed_download(control)
+
+        sources = manifest.get("model_sources")
+        if isinstance(sources, list):
+            for source in sources:
+                _check_managed_download(control)
+                destination = root / source.get("destination", ".")
+                _snapshot_source(source, destination, token)
+                _check_managed_download(control)
+            return
+
+        repo_id = manifest.get("hf_repo")
+        if not repo_id:
+            raise RuntimeError(f"Model {model_id} has no download source")
+        variants = manifest.get("weight_variants")
+        include = list(manifest.get("hf_include_prefixes") or [])
+        skip = list(manifest.get("hf_skip_prefixes") or [])
+        if isinstance(variants, dict):
+            selected = variant_id or variants.get("default")
+            options = [option for option in variants.get("options", []) if option.get("id") == selected]
+            if len(options) != 1:
+                raise RuntimeError(f"Unknown weight variant: {selected}")
+            variant_prefixes = [
+                prefix
+                for option in variants.get("options", [])
+                for prefix in option.get("include_prefixes", [])
+            ]
+            common_source = {
+                "repo_id": repo_id,
+                "include_prefixes": include,
+                "skip_prefixes": [*skip, *variant_prefixes],
+            }
+            _check_managed_download(control)
+            _snapshot_source(common_source, root, token)
+            _check_managed_download(control)
+            include = options[0].get("include_prefixes", [])
+        _check_managed_download(control)
+        _snapshot_source({
+            "repo_id": repo_id,
+            "include_prefixes": include,
+            "skip_prefixes": skip,
+        }, root, token)
+        _check_managed_download(control)
+
+    try:
+        await asyncio.to_thread(download)
+    except ManagedDownloadPaused:
+        return {"success": False, "paused": True}
+    except ManagedDownloadCancelled:
+        return {"success": False, "cancelled": True}
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    finally:
+        if _managed_download_controls.get(model_id) is control:
+            _managed_download_controls.pop(model_id, None)
+    return {"success": True}
+
+
+@router.get("/managed-downloads")
+async def managed_downloads():
+    return [{"modelId": model_id, "percent": 1, "status": "Downloading on server…"} for model_id in _managed_download_controls]
+
+
+@router.post("/managed-download/pause")
+async def pause_managed_download(model_id: str):
+    control = _managed_download_controls.get(model_id)
+    if control is None:
+        raise HTTPException(404, "No active download")
+    control["pause"].set()
+    return {"success": True}
+
+
+@router.post("/managed-download/cancel")
+async def cancel_managed_download(model_id: str):
+    control = _managed_download_controls.get(model_id)
+    if control is None:
+        raise HTTPException(404, "No active download")
+    control["cancel"].set()
+    return {"success": True}
+
+
+@router.delete("/storage/model/{model_id:path}")
+async def delete_model_storage(model_id: str):
+    await unload_model(model_id)
+    shutil.rmtree(_model_root(model_id), ignore_errors=True)
+    return {"success": True}
+
+
+@router.delete("/storage/{model_id:path}/variants/{variant_id}")
+async def delete_model_variant(model_id: str, variant_id: str):
+    manifest = generator_registry.get_manifest(model_id)
+    variants = manifest.get("weight_variants") or {}
+    option = next((item for item in variants.get("options", []) if item.get("id") == variant_id), None)
+    if not option:
+        raise HTTPException(404, "Unknown weight variant")
+    await unload_model(model_id)
+    root = _model_root(model_id)
+    for prefix in option.get("include_prefixes", []):
+        candidate = (root / prefix).resolve()
+        if root.resolve() not in candidate.parents and candidate != root.resolve():
+            raise HTTPException(400, "Unsafe variant path")
+        if candidate.is_dir():
+            shutil.rmtree(candidate)
+        else:
+            candidate.unlink(missing_ok=True)
+    return {"success": True}
+
+
+@router.delete("/storage/extensions/{extension_id}")
+async def delete_extension_storage(extension_id: str):
+    if not _SAFE_MODEL_PART.fullmatch(extension_id):
+        raise HTTPException(400, "Invalid extension id")
+    model_ids = [model_id for model_id in generator_registry._generators if model_id.startswith(f"{extension_id}/")]
+    for model_id in model_ids:
+        await unload_model(model_id)
+    shutil.rmtree(registry_module.MODELS_DIR / extension_id, ignore_errors=True)
+    return {"success": True}
+
+
+@router.delete("/storage/extensions/{extension_id}/shared-groups/{group_id}")
+async def delete_shared_group_storage(extension_id: str, group_id: str):
+    if not _SAFE_MODEL_PART.fullmatch(extension_id) or not _SAFE_MODEL_PART.fullmatch(group_id):
+        raise HTTPException(400, "Invalid shared group id")
+    states = await shared_group_states(extension_id)
+    state = next((item for item in states if item["id"] == group_id), None)
+    if state is None:
+        raise HTTPException(404, "Unknown shared weight group")
+    for model_id in state["dependentModelIds"]:
+        await unload_model(model_id)
+    shutil.rmtree(registry_module.MODELS_DIR / extension_id / "_shared" / group_id, ignore_errors=True)
+    return {"success": True}
 
 
 class DownloadPaused(Exception):

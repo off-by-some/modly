@@ -1,5 +1,6 @@
 import { LocalModel } from '../models'
 import { formatModelName } from '../utils'
+import { useAppStore } from '../../../shared/stores/appStore'
 
 interface Props {
   model:      LocalModel
@@ -9,10 +10,11 @@ interface Props {
 }
 
 export function ModelCard({ model, onDelete, onGenerate, disabled }: Props): JSX.Element {
+  const isRemote = useAppStore((state) => state.backendMode === 'remote')
   return (
     <div className="relative flex flex-col gap-2 px-3.5 py-4 rounded-2xl border transition-all min-h-[110px] bg-zinc-900/60 border-zinc-800 hover:border-zinc-700">
       {/* Open in explorer */}
-      <button
+      {!isRemote && <button
         onClick={() => window.electron.model.showInFolder(model.id)}
         title="Show in explorer"
         className="absolute top-2.5 right-2.5 flex items-center justify-center w-6 h-6 rounded-lg text-zinc-600 hover:text-zinc-300 hover:bg-zinc-700/60 transition-all"
@@ -20,7 +22,7 @@ export function ModelCard({ model, onDelete, onGenerate, disabled }: Props): JSX
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
         </svg>
-      </button>
+      </button>}
 
       {/* Name */}
       <p className="text-xs font-semibold leading-tight truncate text-zinc-200 pr-6">

@@ -67,6 +67,7 @@ export interface IpcMainLike {
 export interface WorkspaceAssetLibraryIpcDeps {
   ipcMain: IpcMainLike
   getWorkspaceDir: () => string
+  getRemoteApiUrl?: () => string | undefined
 }
 
 function libraryError(code: AssetLibraryError['code'], message: string): AssetLibraryError {
@@ -353,15 +354,33 @@ function readPayloadRequest(payload: unknown): { workspacePath?: string, sourceW
 }
 
 export function registerWorkspaceAssetLibraryIpcHandlers(deps: WorkspaceAssetLibraryIpcDeps): void {
-  deps.ipcMain.handle('workspace:library:list', async () => listWorkspaceAssetLibrary({ workspaceDir: deps.getWorkspaceDir() }))
+  const remote = async (path: string, payload?: unknown): Promise<unknown> => {
+    const apiUrl = deps.getRemoteApiUrl?.()
+    if (!apiUrl) return undefined
+    const response = await fetch(`${apiUrl}${path}`, payload === undefined ? undefined : {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error(`Remote workspace request failed: HTTP ${response.status}`)
+    return response.json()
+  }
+  deps.ipcMain.handle('workspace:library:list', async () => {
+    const remoteResult = await remote('/workspace-library')
+    return remoteResult ?? listWorkspaceAssetLibrary({ workspaceDir: deps.getWorkspaceDir() })
+  })
   deps.ipcMain.handle('workspace:library:read', async (_event, payload) => {
     const { workspacePath, sourceWorkspacePath } = readPayloadRequest(payload)
     if (!workspacePath) return { success: false, error: libraryError('invalid-request', 'workspacePath is required.') }
+    const remoteResult = await remote('/workspace-library/read', { workspacePath, sourceWorkspacePath })
+    if (remoteResult) return remoteResult
     return readWorkspaceAssetLibraryEntry({ workspaceDir: deps.getWorkspaceDir(), workspacePath, sourceWorkspacePath })
   })
   deps.ipcMain.handle('workspace:library:open', async (_event, payload) => {
     const { workspacePath, sourceWorkspacePath } = readPayloadRequest(payload)
     if (!workspacePath) return { success: false, error: libraryError('invalid-request', 'workspacePath is required.') }
+    const remoteResult = await remote('/workspace-library/open', { workspacePath, sourceWorkspacePath })
+    if (remoteResult) return remoteResult
     return openWorkspaceAssetLibraryEntry({ workspaceDir: deps.getWorkspaceDir(), workspacePath, sourceWorkspacePath })
   })
 }

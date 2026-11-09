@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Section, Card, Row, PathRow } from '@shared/ui'
+import { useAppStore } from '@shared/stores/appStore'
 
 // ─── MoveFolderModal ──────────────────────────────────────────────────────────
 
@@ -72,6 +73,7 @@ function MoveFolderModal({ title, currentDir, items, itemLabel, moveLabel, moveD
 // ─── StorageSection ───────────────────────────────────────────────────────────
 
 export function StorageSection(): JSX.Element {
+  const backendMode = useAppStore((state) => state.backendMode)
   const [modelsDir,     setModelsDir]     = useState('')
   const [workspaceDir,  setWorkspaceDir]  = useState('')
   const [workflowsDir,  setWorkflowsDir]  = useState('')
@@ -255,7 +257,7 @@ export function StorageSection(): JSX.Element {
   }
 
   return (
-    <Section title="Storage" subtitle="Manage where models and outputs are saved on disk.">
+    <Section title="Storage" subtitle={backendMode === 'remote' ? 'Paths owned by the selected server.' : 'Manage where models and outputs are saved on disk.'}>
       <div className="grid grid-cols-2 gap-4">
 
         <Card title="Directories" description="Paths used to store model weights and generated files.">
@@ -263,23 +265,23 @@ export function StorageSection(): JSX.Element {
             label="Models"
             description="Where downloaded AI model weights are stored."
             value={modelsDir}
-            onBrowse={handleBrowseModels}
+            onBrowse={backendMode === 'local' ? handleBrowseModels : undefined}
           />
           <PathRow
             label="Workspace"
             description="Where generated 3D files are saved."
             value={workspaceDir}
-            onBrowse={handleBrowseWorkspace}
+            onBrowse={backendMode === 'local' ? handleBrowseWorkspace : undefined}
           />
           <PathRow
             label="Workflows"
             description="Where workflow definitions are saved."
             value={workflowsDir}
-            onBrowse={handleBrowseWorkflows}
+            onBrowse={backendMode === 'local' ? handleBrowseWorkflows : undefined}
           />
         </Card>
 
-        <Card title="Cache" description="Temporary files created during generation processing.">
+        {backendMode === 'local' && <Card title="Cache" description="Temporary files created during generation processing.">
           <Row label="Temp files" description="Intermediate files accumulated over time.">
             <button
               onClick={handleClearCache}
@@ -296,7 +298,7 @@ export function StorageSection(): JSX.Element {
                'Clear cache'}
             </button>
           </Row>
-        </Card>
+        </Card>}
 
       </div>
 

@@ -3,12 +3,13 @@ import { buildSync } from 'esbuild'
 import { autoUpdater } from 'electron-updater'
 import { basename, join } from 'path'
 import { rm as rmAsync, readFile, writeFile, mkdir, readdir, rename, cp, symlink, lstat, copyFile } from 'fs/promises'
-import { existsSync, mkdirSync, readdirSync, statSync } from 'fs'
+import { createReadStream, existsSync, mkdirSync, readdirSync, statSync } from 'fs'
 import axios from 'axios'
 import * as tar from 'tar'
 import * as os from 'os'
 import { promisify } from 'util'
 import { PythonBridge, API_BASE_URL } from './python-bridge'
+import { getSelectedApiUrl, isRemoteBackend, setSelectedApiUrl } from './backend-target'
 import {
   isModelDownloaded,
   listDownloadedModels,
@@ -181,6 +182,26 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   }
   const activeDownloads = new Map<string, ActiveDownload>()
   const weightOperations = new ModelWeightOperations()
+  const selectedApiUrl = () => getSelectedApiUrl() || API_BASE_URL
+  const stageFileOnSelectedServer = async (filePath: string): Promise<string> => {
+    if (!isRemoteBackend() || !existsSync(filePath)) return filePath
+    const { data } = await axios.post<{ file_path: string }>(
+      `${selectedApiUrl()}/workspace-admin/upload`,
+      createReadStream(filePath),
+      {
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Modly-Filename': encodeURIComponent(basename(filePath)),
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        timeout: 0,
+      },
+    )
+    return data.file_path
+  }
+
+  ipcMain.handle('backend:select', (_event, apiUrl: string) => ({ apiUrl: setSelectedApiUrl(apiUrl) }))
   // Paused/error sessions retain their original paths even after settings change.
   const interruptedTargets = new Map<string, string[]>()
   const notifyWeightChange = () => {
@@ -197,7 +218,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     for (const id of modelIds) {
       try {
         const response = await axios.post(
-          `${API_BASE_URL}/model/unload/${encodeURIComponent(id)}`, {}, { timeout: 40_000 },
+          `${selectedApiUrl()}/model/unload/${encodeURIComponent(id)}`, {}, { timeout: 40_000 },
         )
         if (response.data?.unloaded !== true) throw new Error('Model unload was not confirmed; weights were preserved')
       } catch (err) {
@@ -210,7 +231,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   async function unloadExtensionForRemoval(extensionId: string) {
     let modelIds: string[]
     try {
-      const { data } = await axios.get<{ id: string }[]>(`${API_BASE_URL}/model/all`, { timeout: 10_000 })
+      const { data } = await axios.get<{ id: string }[]>(`${selectedApiUrl()}/model/all`, { timeout: 10_000 })
       modelIds = data.map((model) => model.id).filter((id) => id.startsWith(`${extensionId}/`))
     } catch (err) {
       if (backendUnreachable(err)) return
@@ -229,6 +250,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.on('log:error', (_event, message: string) => logger.error(`[Renderer] ${message}`))
   ipcMain.handle('log:getPath', () => join(app.getPath('userData'), 'logs', 'modly.log'))
   ipcMain.handle('log:readAll', async (_event, session?: string) => {
+    if (isRemoteBackend()) {
+      const { data } = await axios.get(`${selectedApiUrl()}/logs`, { timeout: 5000 })
+      return data
+    }
     const logsDir = join(app.getPath('userData'), 'logs')
     const dir = session ? join(logsDir, 'sessions', session) : logsDir
     const files = ['modly.log', 'errors.log', 'runtime.log']
@@ -244,6 +269,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     return result
   })
   ipcMain.handle('log:listSessions', () => {
+    if (isRemoteBackend()) {
+      return axios.get(`${selectedApiUrl()}/logs/sessions`, { timeout: 5000 }).then(({ data }) => data)
+    }
     const sessionsDir = join(app.getPath('userData'), 'logs', 'sessions')
     if (!existsSync(sessionsDir)) return []
     try {
@@ -403,7 +431,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('model:unloadAll', async (): Promise<{ success: boolean; error?: string }> => {
     try {
-      await axios.post(`${API_BASE_URL}/model/unload-all`, {}, { timeout: 10_000 })
+      await axios.post(`${selectedApiUrl()}/model/unload-all`, {}, { timeout: 10_000 })
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -411,6 +439,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:delete', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
+    if (isRemoteBackend()) {
+      try {
+        await axios.delete(`${selectedApiUrl()}/model/storage/model/${encodeURIComponent(modelId)}`, { timeout: 60_000 })
+        notifyWeightChange()
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     if (activeDownloads.has(modelId)) {
       return { success: false, error: 'Cannot remove model weights while their download is active' }
     }
@@ -436,6 +473,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:deleteWeightVariant', async (_, modelId: string, variantId: string): Promise<{ success: boolean; error?: string }> => {
+    if (isRemoteBackend()) {
+      try {
+        await axios.delete(`${selectedApiUrl()}/model/storage/${encodeURIComponent(modelId)}/variants/${encodeURIComponent(variantId)}`, { timeout: 60_000 })
+        notifyWeightChange()
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     if (activeDownloads.has(modelId)) {
       return { success: false, error: 'Cannot remove model weights while their download is active' }
     }
@@ -468,6 +514,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:showInFolder', (_, modelId: string) => {
+    if (isRemoteBackend()) return
     const modelDir = join(getSettings(app.getPath('userData')).modelsDir, modelId)
     if (existsSync(modelDir)) {
       shell.openPath(modelDir)
@@ -475,7 +522,23 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   // Read local file → base64 (bypasses file:// restrictions in the renderer)
-  ipcMain.handle('fs:readFileBase64', (_, filePath: string) => readLocalFileBase64(filePath))
+  ipcMain.handle('fs:readFileBase64', async (_, filePath: string) => {
+    if (!isRemoteBackend() || existsSync(filePath)) return readLocalFileBase64(filePath)
+    const { data: paths } = await axios.get<{ workspace_dir: string }>(
+      `${selectedApiUrl()}/settings/paths`, { timeout: 5000 },
+    )
+    const normalizedFile = filePath.replace(/\\/g, '/')
+    const workspaceRoot = paths.workspace_dir.replace(/\\/g, '/').replace(/\/+$/, '')
+    if (!normalizedFile.startsWith(`${workspaceRoot}/`)) {
+      throw new Error('Remote file is outside the selected server workspace')
+    }
+    const relativePath = normalizedFile.slice(workspaceRoot.length + 1)
+    const response = await axios.get<ArrayBuffer>(
+      `${selectedApiUrl()}/workspace/${relativePath.split('/').map(encodeURIComponent).join('/')}`,
+      { responseType: 'arraybuffer', timeout: 60_000, maxContentLength: 100 * 1024 * 1024 },
+    )
+    return Buffer.from(response.data).toString('base64')
+  })
 
   ipcMain.handle('fs:readScreenshotDataUrl', async (_, filename: string) => {
     const filePath = app.isPackaged
@@ -487,11 +550,24 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // Model management
   ipcMain.handle('model:listDownloaded', () => {
+    if (isRemoteBackend()) {
+      return axios.get<{ id: string; name: string; downloaded: boolean; size_gb?: number }[]>(
+        `${selectedApiUrl()}/model/all`, { timeout: 10_000 },
+      ).then(({ data }) => data.filter((model) => model.downloaded).map((model) => ({
+        id: model.id, name: model.name, size_gb: model.size_gb ?? 0,
+      })))
+    }
     const modelsDir = getSettings(app.getPath('userData')).modelsDir
     return listDownloadedModels(modelsDir)
   })
 
   ipcMain.handle('model:isDownloaded', async (_, modelId: string): Promise<boolean> => {
+    if (isRemoteBackend()) {
+      try {
+        const { data } = await axios.get(`${selectedApiUrl()}/model/storage/${encodeURIComponent(modelId)}/state`, { timeout: 10_000 })
+        return Boolean(data.downloaded)
+      } catch { return false }
+    }
     const modelsDir = getSettings(app.getPath('userData')).modelsDir
     try {
       const plan = await resolveInstalledModelDownloadPlan({
@@ -517,6 +593,12 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // null means "unknown" (unreadable plan, or a node without variants) — the renderer
   // must not read an empty array as "no variant installed".
   ipcMain.handle('model:installedWeightVariants', async (_, modelId: string): Promise<string[] | null> => {
+    if (isRemoteBackend()) {
+      try {
+        const { data } = await axios.get(`${selectedApiUrl()}/model/storage/${encodeURIComponent(modelId)}/state`, { timeout: 10_000 })
+        return data.installedWeightVariants ?? null
+      } catch { return null }
+    }
     try {
       const plan = await resolveModelPlan(modelId)
       return plan.kind === 'legacy' && plan.weightVariants
@@ -528,6 +610,12 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:hasLocalData', async (_, modelId: string): Promise<boolean> => {
+    if (isRemoteBackend()) {
+      try {
+        const { data } = await axios.get(`${selectedApiUrl()}/model/storage/${encodeURIComponent(modelId)}/state`, { timeout: 10_000 })
+        return Boolean(data.hasLocalData)
+      } catch { return false }
+    }
     try {
       await resolveModelPlan(modelId)
       return modelHasLocalData(getSettings(app.getPath('userData')).modelsDir, modelId)
@@ -537,6 +625,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:sharedGroups', async (_, extensionId: string) => {
+    if (isRemoteBackend()) {
+      try {
+        const { data } = await axios.get(
+          `${selectedApiUrl()}/model/storage/extensions/${encodeURIComponent(extensionId)}/shared-groups`,
+          { timeout: 10_000 },
+        )
+        return data
+      } catch { return [] }
+    }
     try {
       const groups = await resolveInstalledExtensionSharedWeightGroups({
         extensionId,
@@ -562,6 +659,18 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     extensionId: string,
     groupId: string,
   ): Promise<{ success: boolean; error?: string }> => {
+    if (isRemoteBackend()) {
+      try {
+        await axios.delete(
+          `${selectedApiUrl()}/model/storage/extensions/${encodeURIComponent(extensionId)}/shared-groups/${encodeURIComponent(groupId)}`,
+          { timeout: 60_000 },
+        )
+        notifyWeightChange()
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     try {
       const groups = await resolveInstalledExtensionSharedWeightGroups({
         extensionId,
@@ -598,6 +707,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     _,
     extensionId: string,
   ): Promise<{ success: boolean; error?: string }> => {
+    if (isRemoteBackend()) {
+      try {
+        await axios.delete(`${selectedApiUrl()}/model/storage/extensions/${encodeURIComponent(extensionId)}`, { timeout: 60_000 })
+        notifyWeightChange()
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     try {
       const safeExtensionId = assertSafeExtensionId(extensionId)
       if ([...activeDownloads.keys()].some((modelId) => modelId.split('/', 1)[0] === safeExtensionId)) {
@@ -625,15 +743,41 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   })
 
-  ipcMain.handle('model:activeDownloads', () =>
-    [...activeDownloads.entries()].map(([modelId, active]) => ({ modelId, ...active.progress }))
-  )
+  ipcMain.handle('model:activeDownloads', async () => {
+    if (isRemoteBackend()) {
+      const { data } = await axios.get(`${selectedApiUrl()}/model/managed-downloads`, { timeout: 5000 })
+      return data
+    }
+    return [...activeDownloads.entries()].map(([modelId, active]) => ({ modelId, ...active.progress }))
+  })
 
   ipcMain.handle('model:download', async (
     event,
     modelId: string,
     requestedVariantId?: string | null,
   ) => {
+    if (isRemoteBackend()) {
+      try {
+        event.sender.send('model:downloadProgress', { modelId, variantId: requestedVariantId ?? undefined, percent: 1, status: 'Downloading on server…' })
+        const { data } = await axios.post(`${selectedApiUrl()}/model/managed-download`, null, {
+          params: { model_id: modelId, variant_id: requestedVariantId ?? undefined },
+          timeout: 0,
+        })
+        if (data?.paused) {
+          event.sender.send('model:downloadProgress', { modelId, variantId: requestedVariantId ?? undefined, percent: 1, status: 'paused', paused: true })
+          return { success: false, paused: true }
+        }
+        if (data?.cancelled) {
+          event.sender.send('model:downloadProgress', { modelId, variantId: requestedVariantId ?? undefined, percent: 0, status: 'cancelled', cancelled: true })
+          return { success: false, cancelled: true }
+        }
+        event.sender.send('model:downloadProgress', { modelId, variantId: requestedVariantId ?? undefined, percent: 100, status: 'done' })
+        notifyWeightChange()
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     if (activeDownloads.has(modelId)) {
       return { success: false, error: 'Download already in progress' }
     }
@@ -751,12 +895,20 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:pauseDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
+    if (isRemoteBackend()) {
+      try {
+        await axios.post(`${selectedApiUrl()}/model/managed-download/pause`, null, { params: { model_id: modelId }, timeout: 5000 })
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     try {
       const active = activeDownloads.get(modelId)
       const targetId = active?.currentTargetId
       if (!active || !targetId) return { success: false, error: 'No active download target' }
       active.stopRequested = 'pause'
-      await axios.post(`${API_BASE_URL}/model/hf-download/pause`, null, {
+      await axios.post(`${selectedApiUrl()}/model/hf-download/pause`, null, {
         params: { model_id: targetId },
         timeout: 5000,
       })
@@ -767,11 +919,19 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('model:cancelDownload', async (_, modelId: string): Promise<{ success: boolean; error?: string }> => {
+    if (isRemoteBackend()) {
+      try {
+        await axios.post(`${selectedApiUrl()}/model/managed-download/cancel`, null, { params: { model_id: modelId }, timeout: 5000 })
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     try {
       const active = activeDownloads.get(modelId)
       if (active) active.stopRequested = 'cancel'
       if (active?.currentTargetId) {
-        await axios.post(`${API_BASE_URL}/model/hf-download/cancel`, null, {
+        await axios.post(`${selectedApiUrl()}/model/hf-download/cancel`, null, {
           params: { model_id: active.currentTargetId },
           timeout: 5000,
         })
@@ -824,7 +984,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
     try {
       const response = await axios.get(
-        `${API_BASE_URL}/export/${format}?path=${encodeURIComponent(meshPath)}`,
+        `${selectedApiUrl()}/export/${format}?path=${encodeURIComponent(meshPath)}`,
         { responseType: 'arraybuffer' }
       )
       await writeFile(result.filePath, Buffer.from(response.data as ArrayBuffer))
@@ -862,6 +1022,12 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // On macOS, matches Activity Monitor's "Memory Used":
   //     used = wired + active + compressed.
   ipcMain.handle('system:memory', async () => {
+    if (isRemoteBackend()) {
+      const { data } = await axios.get<{ total: number; used: number; available: number }>(
+        `${selectedApiUrl()}/system/memory`, { timeout: 5000 },
+      )
+      return data
+    }
     const total = os.totalmem()
 
     if (process.platform === 'darwin') {
@@ -910,17 +1076,41 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     }
   }
 
-  ipcMain.handle('settings:get', () => {
+  ipcMain.handle('settings:get', async () => {
     // hfToken is stored encrypted — hand the renderer the usable value.
-    return { ...getSettings(app.getPath('userData')), hfToken: getHfToken() }
+    const local = getSettings(app.getPath('userData'))
+    if (!isRemoteBackend()) return { ...local, hfToken: getHfToken() }
+    const { data } = await axios.get<{
+      models_dir: string
+      workspace_dir: string
+      workflows_dir: string
+      extensions_dir: string
+    }>(`${selectedApiUrl()}/settings/paths`, { timeout: 5000 })
+    return {
+      ...local,
+      modelsDir: data.models_dir,
+      workspaceDir: data.workspace_dir,
+      workflowsDir: data.workflows_dir,
+      extensionsDir: data.extensions_dir,
+      hfToken: getHfToken(),
+    }
   })
 
-  ipcMain.handle('settings:set', async (_event, patch: { modelsDir?: string; workspaceDir?: string; extensionsDir?: string; hfToken?: string }) => {
+  ipcMain.handle('settings:set', async (_event, patch: { modelsDir?: string; workspaceDir?: string; workflowsDir?: string; extensionsDir?: string; hfToken?: string }) => {
     if (patch.modelsDir !== undefined && weightOperations.busy) {
       throw new Error('Cannot change model storage while model weights are busy')
     }
     const { hfToken, ...dirs } = patch
-    setSettings(app.getPath('userData'), dirs)
+    if (isRemoteBackend()) {
+      await axios.post(`${selectedApiUrl()}/settings/paths`, {
+        models_dir: dirs.modelsDir,
+        workspace_dir: dirs.workspaceDir,
+        workflows_dir: dirs.workflowsDir,
+        extensions_dir: dirs.extensionsDir,
+      }, { timeout: 10_000 })
+    } else {
+      setSettings(app.getPath('userData'), dirs)
+    }
     // Keep main-process env in sync so child processes spawned after token change inherit it
     if (hfToken !== undefined) {
       setHfToken(app.getPath('userData'), hfToken)
@@ -930,8 +1120,19 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       // subprocesses spawned by ExtensionProcess._build_env() pick it up
       // without requiring a full app restart.
       try {
-        await axios.post(`${API_BASE_URL}/settings/hf-token`, { token: hfToken }, { timeout: 3000 })
+        await axios.post(`${selectedApiUrl()}/settings/hf-token`, { token: hfToken }, { timeout: 3000 })
       } catch { /* FastAPI may not be running yet — ignore */ }
+    }
+    if (isRemoteBackend()) {
+      const { data } = await axios.get(`${selectedApiUrl()}/settings/paths`, { timeout: 5000 })
+      return {
+        ...getSettings(app.getPath('userData')),
+        modelsDir: data.models_dir,
+        workspaceDir: data.workspace_dir,
+        workflowsDir: data.workflows_dir,
+        extensionsDir: data.extensions_dir,
+        hfToken: getHfToken(),
+      }
     }
     return { ...getSettings(app.getPath('userData')), hfToken: getHfToken() }
   })
@@ -971,9 +1172,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   registerWorkspaceAssetLibraryIpcHandlers({
     ipcMain,
     getWorkspaceDir: () => getSettings(app.getPath('userData')).workspaceDir,
+    getRemoteApiUrl: () => isRemoteBackend() ? selectedApiUrl() : undefined,
   })
 
   ipcMain.handle('workspace:listCollections', async () => {
+    if (isRemoteBackend()) {
+      const { data } = await axios.get(`${selectedApiUrl()}/workspace-admin/collections`, { timeout: 10_000 })
+      return data
+    }
     const base = workspacePath()
     await mkdir(base, { recursive: true })
     const entries = await readdir(base, { withFileTypes: true })
@@ -981,18 +1187,36 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('workspace:createCollection', async (_, name: string) => {
+    if (isRemoteBackend()) {
+      await axios.post(`${selectedApiUrl()}/workspace-admin/collections/${encodeURIComponent(name)}`, {}, { timeout: 10_000 })
+      return
+    }
     await mkdir(workspacePath(name), { recursive: true })
   })
 
   ipcMain.handle('workspace:renameCollection', async (_, { oldName, newName }: { oldName: string; newName: string }) => {
+    if (isRemoteBackend()) {
+      await axios.post(`${selectedApiUrl()}/workspace-admin/rename-collection`, { old_name: oldName, new_name: newName }, { timeout: 10_000 })
+      return
+    }
     await rename(workspacePath(oldName), workspacePath(newName))
   })
 
   ipcMain.handle('workspace:deleteCollection', async (_, name: string) => {
+    if (isRemoteBackend()) {
+      await axios.delete(`${selectedApiUrl()}/workspace-admin/collections/${encodeURIComponent(name)}`, { timeout: 10_000 })
+      return
+    }
     await rmAsync(workspacePath(name), { recursive: true, force: true })
   })
 
   ipcMain.handle('workspace:listJobs', async (_, collection: string) => {
+    if (isRemoteBackend()) {
+      try {
+        const { data } = await axios.get(`${selectedApiUrl()}/workspace-admin/collections/${encodeURIComponent(collection)}/jobs`, { timeout: 10_000 })
+        return data
+      } catch { return [] }
+    }
     try {
       const files = await readdir(workspacePath(collection))
       const metas = files.filter(f => f.endsWith('.meta.json'))
@@ -1004,14 +1228,24 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('workspace:saveJobMeta', async (_, { collection, filename, meta }: { collection: string; filename: string; meta: unknown }) => {
+    if (isRemoteBackend()) {
+      await axios.put(`${selectedApiUrl()}/workspace-admin/collections/${encodeURIComponent(collection)}/jobs`, { filename, meta }, { timeout: 10_000 })
+      return
+    }
     const metaFile = filename.replace(/\.glb$/, '.meta.json')
     await writeFile(workspacePath(collection, metaFile), JSON.stringify(meta, null, 2), 'utf-8')
   })
 
   ipcMain.handle('workspace:deleteJob', async (_, { collection, filename }: { collection: string; filename: string }) => {
+    if (isRemoteBackend()) {
+      await axios.delete(`${selectedApiUrl()}/workspace-admin/collections/${encodeURIComponent(collection)}/jobs/${encodeURIComponent(filename)}`, { timeout: 10_000 })
+      return
+    }
     await rmAsync(workspacePath(collection, filename), { force: true })
     await rmAsync(workspacePath(collection, filename.replace(/\.glb$/, '.meta.json')), { force: true })
   })
+
+  ipcMain.handle('workspace:stageFile', async (_, filePath: string) => stageFileOnSelectedServer(filePath))
 
   // Directory utilities for settings
   ipcMain.handle('fs:listDir', async (_, dirPath: string) => {
@@ -1026,6 +1260,17 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   // List files (not directories) in a folder, optionally filtered by extension.
   // `extensions` are lowercase without the dot (e.g. ['txt', 'png']).
   ipcMain.handle('fs:listFiles', async (_, dirPath: string, extensions?: string[]) => {
+    if (isRemoteBackend() && !existsSync(dirPath)) {
+      try {
+        const { data } = await axios.post<string[]>(`${selectedApiUrl()}/workspace-admin/list-files`, {
+          path: dirPath,
+          extensions,
+        }, { timeout: 10_000 })
+        return data
+      } catch {
+        return []
+      }
+    }
     try {
       const wanted = extensions?.map(e => e.toLowerCase().replace(/^\./, ''))
       const entries = await readdir(dirPath, { withFileTypes: true })
@@ -1055,8 +1300,8 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     return result.canceled ? null : result.filePaths[0]
   })
 
-  // Add a local GGUF to the agent's models folder. Picking and copying both
-  // happen here, so the renderer never hands main an arbitrary path to copy.
+  // Add a local GGUF to the selected server. The picker remains a client-side
+  // concern; remote files are streamed so multi-GB weights never sit in memory.
   ipcMain.handle('agent:addModel', async (): Promise<{ success: boolean; cancelled?: boolean; fileName?: string; error?: string }> => {
     const win = getWindow()
     if (!win) return { success: false, error: 'No window available' }
@@ -1070,6 +1315,26 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const src      = result.filePaths[0]
     const fileName = basename(src)
     if (!fileName.toLowerCase().endsWith('.gguf')) return { success: false, error: 'Only .gguf files can be added.' }
+
+    if (isRemoteBackend()) {
+      try {
+        await axios.post(`${selectedApiUrl()}/llm/models/upload`, createReadStream(src), {
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Modly-Filename': encodeURIComponent(fileName),
+          },
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+          timeout: 0,
+        })
+        return { success: true, fileName }
+      } catch (err) {
+        return {
+          success: false,
+          error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err),
+        }
+      }
+    }
 
     const modelsDir = join(getSettings(app.getPath('userData')).agentDir, 'models')
     const dest      = join(modelsDir, fileName)
@@ -1101,6 +1366,20 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   })
 
   ipcMain.handle('fs:deleteDirectory', async (_, dirPath: string) => {
+    if (isRemoteBackend()) {
+      try {
+        const { data: paths } = await axios.get<{ workspace_dir: string }>(
+          `${selectedApiUrl()}/settings/paths`, { timeout: 5000 },
+        )
+        const normalized = dirPath.replace(/\\/g, '/').replace(/\/+$/, '')
+        const remoteTmp = `${paths.workspace_dir.replace(/\\/g, '/').replace(/\/+$/, '')}/tmp`
+        if (normalized !== remoteTmp) return { success: false, error: 'Only the selected server workspace temp directory can be cleared' }
+        await axios.delete(`${selectedApiUrl()}/workspace-admin/tmp`, { timeout: 10_000 })
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: String(err) }
+      }
+    }
     const userData = app.getPath('userData')
     const settings = getSettings(userData)
     const allowedRoots = [
@@ -1292,7 +1571,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     let payload: unknown
     try {
       const response = await axios.post(
-        `${API_BASE_URL}/extensions/reload`,
+        `${selectedApiUrl()}/extensions/reload`,
         validationCapability ? { validationCapability } : {},
         { timeout: 10_000 },
       )
@@ -1315,7 +1594,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     let payload: unknown
     try {
       const response = await axios.post(
-        `${API_BASE_URL}/extensions/reload`,
+        `${selectedApiUrl()}/extensions/reload`,
         {},
         { timeout: 10_000 },
       )
@@ -1396,6 +1675,10 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // Extensions — reads user extensions directory + built-in extensions directory
   ipcMain.handle('extensions:list', async () => {
+    if (isRemoteBackend()) {
+      const { data } = await axios.get(`${selectedApiUrl()}/extensions/list`, { timeout: 10_000 })
+      return data
+    }
     const userData      = app.getPath('userData')
     const extensionsDir = getSettings(userData).extensionsDir
     const builtinDir    = getBuiltinExtensionsDir()
@@ -1493,6 +1776,22 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   ipcMain.handle('extensions:installFromGitHub', async (event, githubUrl: string) => {
     const win    = getWindow()
     const emit   = (data: object) => win?.webContents.send('extensions:installProgress', data)
+    if (isRemoteBackend()) {
+      try {
+        emit({ step: 'downloading', percent: 0 })
+        const { data } = await axios.post(
+          `${selectedApiUrl()}/extensions/install-github`,
+          { url: githubUrl },
+          { timeout: 30 * 60_000 },
+        )
+        emit({ step: 'done', extensionId: data.extensionId })
+        return data
+      } catch (err) {
+        const error = axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err)
+        emit({ step: 'error', message: error })
+        return { success: false, error }
+      }
+    }
     const tmpDir = app.getPath('temp')
 
     let tarPath    = ''
@@ -1844,6 +2143,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // Uninstall an extension — built-ins cannot be uninstalled
   ipcMain.handle('extensions:uninstall', async (_, extensionId: string) => {
+    if (isRemoteBackend()) {
+      try {
+        await axios.delete(`${selectedApiUrl()}/extensions/${encodeURIComponent(extensionId)}`, { timeout: 60_000 })
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     try {
       if ([...activeDownloads.keys()].some((modelId) => modelId.split('/', 1)[0] === extensionId)) {
         return { success: false, error: 'Cannot uninstall an extension while its model download is active' }
@@ -1881,7 +2188,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       }
       // Hot-reload Python so it stops using the deleted model extension
       try {
-        await axios.post(`${API_BASE_URL}/extensions/reload`, {}, { timeout: 10_000 })
+        await axios.post(`${selectedApiUrl()}/extensions/reload`, {}, { timeout: 10_000 })
       } catch { /* ignore if Python is not running */ }
       return { success: true }
     } catch (err) {
@@ -1891,6 +2198,15 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // Re-run setup.py for a model extension (creates the venv if missing)
   ipcMain.handle('extensions:repair', async (_, extensionId: string) => {
+    if (isRemoteBackend()) {
+      try {
+        await axios.post(`${selectedApiUrl()}/extensions/setup/${encodeURIComponent(extensionId)}`, {}, { timeout: 30 * 60_000 })
+        await axios.post(`${selectedApiUrl()}/extensions/reload`, {}, { timeout: 60_000 })
+        return { success: true }
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     try {
       const safeExtensionId = assertSafeExtensionId(extensionId)
       const extensionsDir = getSettings(app.getPath('userData')).extensionsDir
@@ -1947,6 +2263,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // Install a local extension by creating a symlink/junction to a local folder
   ipcMain.handle('extensions:installFromLocal', async () => {
+    if (isRemoteBackend()) {
+      return { success: false, error: 'Local-folder extensions cannot be linked to a remote server. Install from GitHub instead.' }
+    }
     const win  = getWindow()
     const emit = (data: object) => win?.webContents.send('extensions:installProgress', data)
 
@@ -2112,9 +2431,9 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // Trigger Python extension reload (without touching the filesystem)
   ipcMain.handle('extensions:reload', async () => {
-    terminateAllProcessRunners()
+    if (!isRemoteBackend()) terminateAllProcessRunners()
     try {
-      const res = await axios.post(`${API_BASE_URL}/extensions/reload`, {}, { timeout: 10_000 })
+      const res = await axios.post(`${selectedApiUrl()}/extensions/reload`, {}, { timeout: 60_000 })
       return { success: true, errors: (res.data as { errors?: Record<string, string> }).errors ?? {} }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -2123,6 +2442,26 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // Run a process extension in an isolated worker thread
   ipcMain.handle('extensions:runProcess', async (_, extensionId: string, input: { filePath?: string; text?: string; texts?: (string | undefined)[]; nodeId?: string }, params: Record<string, unknown>) => {
+    if (isRemoteBackend()) {
+      try {
+        const remoteInput = { ...input }
+        if (remoteInput.filePath) remoteInput.filePath = await stageFileOnSelectedServer(remoteInput.filePath)
+        const remoteParams = { ...params }
+        if (Array.isArray(remoteParams.extra_image_paths)) {
+          remoteParams.extra_image_paths = await Promise.all(
+            remoteParams.extra_image_paths.map((path) => typeof path === 'string' ? stageFileOnSelectedServer(path) : path),
+          )
+        }
+        const { data } = await axios.post(`${selectedApiUrl()}/extensions/run-process`, {
+          extension_id: extensionId,
+          input: remoteInput,
+          params: remoteParams,
+        }, { timeout: 0 })
+        return data
+      } catch (err) {
+        return { success: false, error: axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err) }
+      }
+    }
     const userData        = app.getPath('userData')
     const { extensionsDir, workspaceDir } = getSettings(userData)
 
@@ -2185,7 +2524,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       if (patch.modelsDir !== undefined && weightOperations.busy) {
         throw new Error('Cannot change model storage while model weights are busy')
       }
-      await axios.post(`${API_BASE_URL}/settings/paths`, {
+      await axios.post(`${selectedApiUrl()}/settings/paths`, {
         models_dir:     patch.modelsDir,
         workspace_dir:  patch.workspaceDir,
         extensions_dir: patch.extensionsDir,
@@ -2198,31 +2537,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   // ── Workflows ────────────────────────────────────────────────────────────
 
-  function workflowsDir(): string {
-    const dir = getSettings(app.getPath('userData')).workflowsDir
-    if (!existsSync(dir)) require('fs').mkdirSync(dir, { recursive: true })
-    return dir
-  }
-
   ipcMain.handle('workflows:list', async () => {
-    const dir = workflowsDir()
-    const files = readdirSync(dir).filter(f => f.endsWith('.json'))
-    const workflows = []
-    for (const file of files) {
-      try {
-        const raw = await readFile(join(dir, file), 'utf-8')
-        workflows.push(JSON.parse(raw))
-      } catch { /* skip corrupted files */ }
-    }
-    return workflows.sort((a: { updatedAt?: string }, b: { updatedAt?: string }) =>
-      (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')
-    )
+    const { data } = await axios.get(`${selectedApiUrl()}/workflows`, { timeout: 10_000 })
+    return data
   })
 
   ipcMain.handle('workflows:save', async (_, workflow: { id: string; [key: string]: unknown }) => {
     try {
-      const path = join(workflowsDir(), `${workflow.id}.json`)
-      await writeFile(path, JSON.stringify(workflow, null, 2), 'utf-8')
+      await axios.put(`${selectedApiUrl()}/workflows/${encodeURIComponent(workflow.id)}`, workflow, { timeout: 10_000 })
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -2231,7 +2553,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
 
   ipcMain.handle('workflows:delete', async (_, id: string) => {
     try {
-      await rmAsync(join(workflowsDir(), `${id}.json`), { force: true })
+      await axios.delete(`${selectedApiUrl()}/workflows/${encodeURIComponent(id)}`, { timeout: 10_000 })
       return { success: true }
     } catch (err) {
       return { success: false, error: String(err) }
@@ -2250,7 +2572,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
       const raw = await readFile(result.filePaths[0], 'utf-8')
       const workflow = JSON.parse(raw)
       if (!workflow.id || !workflow.nodes) return { success: false, error: 'Invalid workflow file' }
-      await writeFile(join(workflowsDir(), `${workflow.id}.json`), JSON.stringify(workflow, null, 2), 'utf-8')
+      await axios.put(`${selectedApiUrl()}/workflows/${encodeURIComponent(workflow.id)}`, workflow, { timeout: 10_000 })
       return { success: true, workflow }
     } catch (err) {
       return { success: false, error: String(err) }

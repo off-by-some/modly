@@ -1,8 +1,10 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { checkBackendServer, normalizeBackendUrl, type BackendMode } from '../utils/backendServer'
 
 export type UiScale = 'small' | 'medium' | 'large' | 'very-large'
 export type BackendStatus = 'not_started' | 'starting' | 'ready' | 'error'
+export type RemoteBackendStatus = 'unknown' | 'online' | 'offline'
 export type SetupStatus = 'idle' | 'checking' | 'needed' | 'installing' | 'done' | 'error'
 export interface SetupProgress { step: string; percent: number; currentPackage?: string }
 
@@ -85,6 +87,11 @@ interface AppState {
   backendStatus: BackendStatus
   apiUrl: string
   backendError: string | null
+  backendMode: BackendMode
+  remoteApiUrl: string
+  remoteBackendStatus: RemoteBackendStatus
+  setRemoteBackendStatus: (status: RemoteBackendStatus) => void
+  setBackendServer: (mode: BackendMode, remoteUrl?: string) => Promise<void>
 
   // Current generation
   currentJob: GenerationJob | null
@@ -170,6 +177,32 @@ export const useAppStore = create<AppState>()(
       backendStatus: 'not_started',
       apiUrl: '',
       backendError: null,
+      backendMode: 'local',
+      remoteApiUrl: '',
+      remoteBackendStatus: 'unknown',
+      setRemoteBackendStatus: (status) => set({ remoteBackendStatus: status }),
+
+      setBackendServer: async (mode, remoteUrl = '') => {
+        const resetServerState = {
+          currentJob: null,
+          meshHistory: [],
+          historyIndex: -1,
+          meshStats: null,
+          meshSelected: false,
+        }
+        if (mode === 'remote') {
+          const apiUrl = await checkBackendServer(remoteUrl)
+          await window.electron.backend.select(apiUrl)
+          set({ ...resetServerState, backendMode: 'remote', remoteApiUrl: apiUrl, remoteBackendStatus: 'online', apiUrl, backendError: null })
+          return
+        }
+
+        const result = await window.electron.python.start()
+        if (!result.success) throw new Error(result.error ?? 'Failed to start the bundled server')
+        const { apiUrl } = await window.electron.app.info()
+        await window.electron.backend.select(apiUrl)
+        set({ ...resetServerState, backendMode: 'local', remoteBackendStatus: 'unknown', apiUrl, backendError: null })
+      },
 
       setupStatus: 'idle',
       setupProgress: null,
@@ -278,15 +311,30 @@ export const useAppStore = create<AppState>()(
 
         window.electron.python.offCrashed()
         window.electron.python.onCrashed(({ code }) => {
+          if (get().backendMode !== 'local') return
           const msg = `FastAPI process crashed unexpectedly (exit code: ${code ?? 'unknown'})`
           set({ backendStatus: 'error', apiUrl: '', backendError: msg })
           get().showError(msg)
         })
 
         try {
+          const { backendMode, remoteApiUrl } = get()
+          if (backendMode === 'remote' && remoteApiUrl) {
+            try {
+              const apiUrl = normalizeBackendUrl(remoteApiUrl)
+              await window.electron.backend.select(apiUrl)
+              set({ backendStatus: 'ready', remoteBackendStatus: 'unknown', apiUrl })
+              return
+            } catch {
+              // A malformed persisted value should never prevent access to Settings.
+              set({ backendMode: 'local', remoteApiUrl: '' })
+            }
+          }
+
           const result = await window.electron.python.start()
           if (!result.success) throw new Error(result.error ?? 'Failed to start backend')
           const { apiUrl } = await window.electron.app.info()
+          await window.electron.backend.select(apiUrl)
           set({ backendStatus: 'ready', apiUrl })
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
@@ -315,6 +363,8 @@ export const useAppStore = create<AppState>()(
         useAtkinsonFont: state.useAtkinsonFont,
         uiScale: state.uiScale,
         lightSettings: state.lightSettings,
+        backendMode: state.backendMode,
+        remoteApiUrl: state.remoteApiUrl,
       }),
     }
   )

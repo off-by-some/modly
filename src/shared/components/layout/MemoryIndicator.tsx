@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useAppStore } from '@shared/stores/appStore'
 
 const GB = 1024 ** 3
 
@@ -7,6 +8,7 @@ function fmtGB(bytes: number): string {
 }
 
 export default function MemoryIndicator(): JSX.Element | null {
+  const backendMode = useAppStore((state) => state.backendMode)
   const [mem, setMem] = useState<{ total: number; used: number; available: number } | null>(null)
 
   useEffect(() => {
@@ -51,7 +53,9 @@ export default function MemoryIndicator(): JSX.Element | null {
       className="flex items-center gap-2 mr-3 px-2.5 py-1 rounded-md bg-zinc-800/60 border border-zinc-700/60 no-drag"
       title={tooltip}
     >
-      <span className="text-[10px] font-medium text-zinc-500 tracking-wide uppercase">RAM</span>
+      <span className="text-[10px] font-medium text-zinc-500 tracking-wide uppercase">
+        {backendMode === 'remote' ? 'Server RAM' : 'RAM'}
+      </span>
       <div className="w-20 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
         <div
           className={`h-full ${barColor} transition-all duration-500 ease-out`}
