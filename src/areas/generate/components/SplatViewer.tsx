@@ -2,6 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState }
 import { Canvas, useFrame } from '@react-three/fiber'
 import * as THREE from 'three'
 import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d'
+import { apiFetch } from '@shared/utils/apiRequest'
 
 export interface SplatViewerHandle {
   screenshot: () => string | null
@@ -203,6 +204,7 @@ const SplatViewer = forwardRef<SplatViewerHandle, { url: string; autoRotate: boo
 
     let disposed = false
     let viewer: any = null
+    let objectUrl = ''
 
     try {
       viewer = new GaussianSplats3D.Viewer({
@@ -231,12 +233,20 @@ const SplatViewer = forwardRef<SplatViewerHandle, { url: string; autoRotate: boo
       const grid = new THREE.GridHelper(10, 20, 0x3f3f46, 0x27272a)
       viewer.threeScene.add(grid)
 
-      viewer
-        .addSplatScene(url, {
+      void apiFetch(url)
+        .then((response) => {
+          if (!response.ok) throw new Error(`Server returned HTTP ${response.status}`)
+          return response.blob()
+        })
+        .then((blob) => {
+          if (disposed) return
+          objectUrl = URL.createObjectURL(blob)
+          return viewer.addSplatScene(objectUrl, {
           format:          GaussianSplats3D.SceneFormat.Splat,
           showLoadingUI:   false,
           progressiveLoad: false,
           rotation:        [0, 0, 1, 0],   // 180° about Z — 3DGS is Y-down; stands it upright while keeping the front toward the camera (X-mirror is invisible on a symmetric model)
+          })
         })
         .then(() => {
           if (disposed) return
@@ -263,6 +273,7 @@ const SplatViewer = forwardRef<SplatViewerHandle, { url: string; autoRotate: boo
         viewer?.stop()
         viewer?.dispose()
       } catch { /* already torn down */ }
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
   }, [url])
 

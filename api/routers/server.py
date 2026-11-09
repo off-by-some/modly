@@ -195,11 +195,20 @@ async def upload_workspace_file(request: Request, x_modly_filename: str = Header
     upload_dir.mkdir(parents=True, exist_ok=True)
     destination = upload_dir / f"{uuid.uuid4().hex}-{file_name}"
     partial = destination.with_suffix(destination.suffix + ".uploading")
+    max_bytes = int(os.environ.get("MODLY_MAX_ASSET_UPLOAD_BYTES", 1024 * 1024 * 1024))
+    received = 0
     try:
         with partial.open("xb") as output:
             async for chunk in request.stream():
                 if chunk:
+                    received += len(chunk)
+                    if received > max_bytes:
+                        raise HTTPException(413, "Asset exceeds the server upload limit")
                     output.write(chunk)
+    except HTTPException:
+        partial.unlink(missing_ok=True)
+        raise
+    try:
         partial.replace(destination)
     except Exception as exc:
         partial.unlink(missing_ok=True)

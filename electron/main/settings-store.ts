@@ -10,6 +10,8 @@ export interface AppSettings {
   /** Local LLM engine, GGUF models, logs and config used by the agent. */
   agentDir:         string
   hfToken?:         string
+  /** Last selected API endpoint, used to build the renderer CSP before load. */
+  backendApiUrl?:    string
 }
 
 function settingsPath(userData: string): string {

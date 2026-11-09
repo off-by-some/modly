@@ -8,6 +8,7 @@ import { initAutoUpdater } from './updater'
 import { syncBuiltinExtensions } from './builtin-sync'
 import { reconcileInterruptedExtensionInstalls } from './extension-install-recovery'
 import { getSettings } from './settings-store'
+import { getSelectedApiUrl, LOCAL_API_URL, setSelectedApiUrl } from './backend-target'
 
 let mainWindow: BrowserWindow | null = null
 let pythonBridge: PythonBridge | null = null
@@ -96,6 +97,38 @@ app.whenReady().then(async () => {
 
   // Clear Chromium disk cache on startup to recover from any corruption
   await session.defaultSession.clearCache()
+
+  // The renderer may contact only the bundled API and the single endpoint the
+  // user selected. Server changes reload the renderer so this policy is never
+  // widened to arbitrary HTTP(S) destinations.
+  const savedApiUrl = getSettings(app.getPath('userData')).backendApiUrl || LOCAL_API_URL
+  try { setSelectedApiUrl(savedApiUrl) } catch { setSelectedApiUrl(LOCAL_API_URL) }
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    let selectedOrigin = LOCAL_API_URL
+    try { selectedOrigin = new URL(getSelectedApiUrl()).origin } catch { /* local fallback */ }
+    const devOrigin = is.dev && process.env['ELECTRON_RENDERER_URL']
+      ? new URL(process.env['ELECTRON_RENDERER_URL']).origin
+      : ''
+    const devWebSocketOrigin = devOrigin.replace(/^http/, 'ws')
+    const connectSources = ["'self'", 'blob:', LOCAL_API_URL, selectedOrigin, devOrigin, devWebSocketOrigin]
+      .filter(Boolean)
+      .join(' ')
+    const csp = [
+      "default-src 'self'",
+      "script-src 'self' 'wasm-unsafe-eval'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com",
+      "img-src 'self' data: blob: file:",
+      `connect-src ${connectSources}`,
+      "worker-src 'self' blob:",
+    ].join('; ')
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [csp],
+      },
+    })
+  })
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)

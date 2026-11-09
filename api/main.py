@@ -4,10 +4,12 @@ Runs locally within the Electron app to provide AI inference endpoints.
 """
 import logging
 import os
+import ipaddress
+import secrets
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi import HTTPException
@@ -35,8 +37,15 @@ from routers import generation, model, optimize, status, settings, extensions, e
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: initialize the registry (instantiates all adapters)
-    from services.generator_registry import generator_registry
+    # The API owns its extension set. Restore any interrupted transaction and
+    # refresh built-ins before the registry sees the directory.
+    from services.generator_registry import generator_registry, EXTENSIONS_DIR
+    from services.builtin_extensions import sync_builtin_extensions
+    from services.extension_installer import recover_interrupted_installs
+    if EXTENSIONS_DIR is not None:
+        recover_interrupted_installs(EXTENSIONS_DIR)
+        if os.environ.get("MODLY_DESKTOP_MANAGED") != "1":
+            sync_builtin_extensions(EXTENSIONS_DIR)
     generator_registry.initialize()
     yield
     # Shutdown: unload all models and stop the local LLM server
@@ -58,11 +67,53 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+def _is_loopback_client(host: str | None) -> bool:
+    if host in (None, "testclient"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+@app.middleware("http")
+async def require_remote_authentication(request: Request, call_next):
+    """Keep an unconfigured server local-only; require a bearer token remotely."""
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    expected = os.environ.get("MODLY_SERVER_TOKEN", "")
+    if not expected and _is_loopback_client(request.client.host if request.client else None):
+        return await call_next(request)
+    if not expected:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Remote access is disabled. Set MODLY_SERVER_TOKEN on the server."},
+        )
+    authorization = request.headers.get("authorization", "")
+    supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+            content={"detail": "A valid Modly server token is required."},
+        )
+    return await call_next(request)
+
+
+_configured_origins = [
+    origin.strip()
+    for origin in os.environ.get("MODLY_ALLOWED_ORIGINS", "null,file://,http://localhost:5173").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_configured_origins,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-HF-Token", "X-Modly-Filename"],
     # drei's SplatLoader reads Content-Length to size its buffers; cross-origin
     # JS can only see it when the server explicitly exposes the header.
     expose_headers=["Content-Length"],

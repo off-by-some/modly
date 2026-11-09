@@ -9,7 +9,7 @@ import * as tar from 'tar'
 import * as os from 'os'
 import { promisify } from 'util'
 import { PythonBridge, API_BASE_URL } from './python-bridge'
-import { getSelectedApiUrl, isRemoteBackend, setSelectedApiUrl } from './backend-target'
+import { getSelectedApiHeaders, getSelectedApiUrl, isRemoteBackend, normalizeSelectedApiUrl, setSelectedApiUrl } from './backend-target'
 import {
   isModelDownloaded,
   listDownloadedModels,
@@ -183,6 +183,25 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
   const activeDownloads = new Map<string, ActiveDownload>()
   const weightOperations = new ModelWeightOperations()
   const selectedApiUrl = () => getSelectedApiUrl() || API_BASE_URL
+  // Attach the selected server credential only to that exact API prefix. The
+  // global client is also used for GitHub/Hugging Face, so host + path matching
+  // is mandatory to prevent credential leakage.
+  axios.interceptors?.request?.use((config) => {
+    const authorization = getSelectedApiHeaders?.()?.Authorization
+    if (!authorization || !config.url) return config
+    try {
+      const requestUrl = new URL(config.url, config.baseURL)
+      const base = new URL(selectedApiUrl())
+      const basePath = base.pathname.replace(/\/+$/, '')
+      if (
+        requestUrl.origin === base.origin
+        && (requestUrl.pathname === basePath || requestUrl.pathname.startsWith(`${basePath}/`))
+      ) {
+        config.headers.set('Authorization', authorization)
+      }
+    } catch { /* Axios handles malformed request URLs. */ }
+    return config
+  })
   const stageFileOnSelectedServer = async (filePath: string): Promise<string> => {
     if (!isRemoteBackend() || !existsSync(filePath)) return filePath
     const { data } = await axios.post<{ file_path: string }>(
@@ -201,7 +220,22 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     return data.file_path
   }
 
-  ipcMain.handle('backend:select', (_event, apiUrl: string) => ({ apiUrl: setSelectedApiUrl(apiUrl) }))
+  ipcMain.handle('backend:check', async (_event, apiUrl: string, token = '') => {
+    const normalized = normalizeSelectedApiUrl(apiUrl)
+    const { data } = await axios.get<{ status?: string }>(`${normalized}/health`, {
+      timeout: 5000,
+      headers: token.trim() ? { Authorization: `Bearer ${token.trim()}` } : undefined,
+    })
+    if (data.status !== 'ok') throw new Error('The server returned an unexpected health response.')
+    return { apiUrl: normalized }
+  })
+  ipcMain.handle('backend:select', (_event, apiUrl: string, token = '') => {
+    const previous = getSelectedApiUrl()
+    const selected = setSelectedApiUrl(apiUrl, token)
+    setSettings(app.getPath('userData'), { backendApiUrl: selected })
+    if (selected !== previous) setTimeout(() => getWindow()?.webContents.reload(), 250)
+    return { apiUrl: selected }
+  })
   // Paused/error sessions retain their original paths even after settings change.
   const interruptedTargets = new Map<string, string[]>()
   const notifyWeightChange = () => {
@@ -1173,6 +1207,7 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     ipcMain,
     getWorkspaceDir: () => getSettings(app.getPath('userData')).workspaceDir,
     getRemoteApiUrl: () => isRemoteBackend() ? selectedApiUrl() : undefined,
+    getRemoteApiHeaders: getSelectedApiHeaders,
   })
 
   ipcMain.handle('workspace:listCollections', async () => {
@@ -1778,14 +1813,41 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
     const emit   = (data: object) => win?.webContents.send('extensions:installProgress', data)
     if (isRemoteBackend()) {
       try {
-        emit({ step: 'downloading', percent: 0 })
-        const { data } = await axios.post(
+        const response = await axios.post<NodeJS.ReadableStream>(
           `${selectedApiUrl()}/extensions/install-github`,
           { url: githubUrl },
-          { timeout: 30 * 60_000 },
+          {
+            responseType: 'stream',
+            timeout: 0,
+            headers: { Accept: 'text/event-stream' },
+          },
         )
-        emit({ step: 'done', extensionId: data.extensionId })
-        return data
+        let buffer = ''
+        let result: Record<string, unknown> | null = null
+        let serverError = ''
+        const consumeEvent = (block: string) => {
+          const payload = block
+            .split('\n')
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart())
+            .join('\n')
+          if (!payload) return
+          const event = JSON.parse(payload) as Record<string, unknown>
+          if (event.step === 'result') result = event
+          else if (event.step === 'error') serverError = String(event.message ?? 'Extension installation failed')
+          else emit(event)
+        }
+        for await (const chunk of response.data) {
+          buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk)
+          const blocks = buffer.split(/\r?\n\r?\n/)
+          buffer = blocks.pop() ?? ''
+          for (const block of blocks) consumeEvent(block)
+        }
+        if (buffer.trim()) consumeEvent(buffer)
+        if (serverError) throw new Error(serverError)
+        if (!result || result.success !== true) throw new Error('The server ended the install without a result')
+        emit({ step: 'done', extensionId: result.extensionId })
+        return result
       } catch (err) {
         const error = axios.isAxiosError(err) ? (err.response?.data?.detail ?? err.message) : String(err)
         emit({ step: 'error', message: error })

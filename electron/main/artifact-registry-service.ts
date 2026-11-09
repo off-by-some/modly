@@ -68,6 +68,7 @@ export interface WorkspaceAssetLibraryIpcDeps {
   ipcMain: IpcMainLike
   getWorkspaceDir: () => string
   getRemoteApiUrl?: () => string | undefined
+  getRemoteApiHeaders?: () => Record<string, string>
 }
 
 function libraryError(code: AssetLibraryError['code'], message: string): AssetLibraryError {
@@ -357,11 +358,14 @@ export function registerWorkspaceAssetLibraryIpcHandlers(deps: WorkspaceAssetLib
   const remote = async (path: string, payload?: unknown): Promise<unknown> => {
     const apiUrl = deps.getRemoteApiUrl?.()
     if (!apiUrl) return undefined
-    const response = await fetch(`${apiUrl}${path}`, payload === undefined ? undefined : {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
+    const headers = deps.getRemoteApiHeaders?.() ?? {}
+    const response = await fetch(`${apiUrl}${path}`, payload === undefined
+      ? { headers }
+      : {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify(payload),
+        })
     if (!response.ok) throw new Error(`Remote workspace request failed: HTTP ${response.status}`)
     return response.json()
   }

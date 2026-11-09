@@ -46,7 +46,7 @@ def request_for(sources: list[dict]) -> Request:
         "type": "http",
         "method": "POST",
         "path": "/model/hf-download-sources",
-        "headers": [(b"authorization", b"Bearer test-token")],
+        "headers": [(b"x-hf-token", b"test-token")],
         "query_string": b"",
         "server": ("test", 80),
         "client": ("test", 1),

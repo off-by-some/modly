@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { useCallback, useEffect, useMemo } from 'react'
 import { useAppStore } from './appStore'
+import { apiFetch } from '../utils/apiRequest'
 
 export interface LlmModel {
   id:                string
@@ -61,7 +62,7 @@ export const useLlmModelsStore = create<LlmModelsStore>((set, get) => ({
         set({ loading: true, error: null })  // the request we waited on may have failed
       }
       try {
-        const res = await fetch(`${apiUrl}/llm/models`)
+        const res = await apiFetch(`${apiUrl}/llm/models`)
         const data: { models?: LlmModel[] } = await res.json()
         set({ models: data.models ?? [], fetchedApiUrl: apiUrl, loading: false, error: null })
       } catch (e) {

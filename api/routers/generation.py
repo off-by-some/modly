@@ -16,6 +16,7 @@ import re as _re
 # binding captured at import would keep writing output to the old directory.
 import services.generator_registry as registry
 from services.generator_registry import generator_registry
+from services.upload_limits import read_upload_limited
 from schemas.generation import GenerateFromArtifactRequest, JobStatus
 from services.artifact_input import (
     RESERVED_ARTIFACT_PARAMS,
@@ -132,7 +133,7 @@ async def generate_from_image(
         model_params = {}
 
     job_id      = str(uuid.uuid4())
-    image_bytes = await image.read()
+    image_bytes = await read_upload_limited(image, 50 * 1024 * 1024, "Image")
     full_params = {
         "remesh":             remesh,
         "enable_texture":     enable_texture,

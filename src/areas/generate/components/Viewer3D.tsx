@@ -205,12 +205,18 @@ function MeshModel({ url, jobId, viewMode, selected, onStats, onSelect, onObject
 }
 
 function GltfMeshModel(props: MeshModelProps): JSX.Element {
-  const { scene } = useGLTF(props.url)
+  const apiToken = useAppStore((state) => state.apiToken)
+  const { scene } = useGLTF(props.url, true, true, (loader) => {
+    loader.setRequestHeader(apiToken ? { Authorization: `Bearer ${apiToken}` } : {})
+  })
   return <SceneMeshModel {...props} scene={scene} loaderType="gltf" />
 }
 
 function ObjMeshModel(props: MeshModelProps): JSX.Element {
-  const scene = useLoader(OBJLoader, props.url)
+  const apiToken = useAppStore((state) => state.apiToken)
+  const scene = useLoader(OBJLoader, props.url, (loader) => {
+    loader.setRequestHeader(apiToken ? { Authorization: `Bearer ${apiToken}` } : {})
+  })
   return <SceneMeshModel {...props} scene={scene} loaderType="obj" />
 }
 

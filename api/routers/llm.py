@@ -136,10 +136,15 @@ async def upload_model(request: Request, x_modly_filename: str = Header(...)):
     if partial.exists():
         raise HTTPException(status_code=409, detail=f'An upload for "{file_name}" is already in progress')
 
+    max_bytes = int(os.environ.get("MODLY_MAX_GGUF_UPLOAD_BYTES", 32 * 1024 * 1024 * 1024))
+    received = 0
     try:
         with partial.open("xb") as output:
             async for chunk in request.stream():
                 if chunk:
+                    received += len(chunk)
+                    if received > max_bytes:
+                        raise HTTPException(413, "GGUF exceeds the server upload limit")
                     output.write(chunk)
         partial.replace(destination)
     except HTTPException:

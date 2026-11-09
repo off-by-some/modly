@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
 import { useApi } from '@shared/hooks/useApi'
 import { FieldLabel, Tooltip, ConfirmModal } from '@shared/components/ui'
+import { apiFetch } from '@shared/utils/apiRequest'
 
 import type { CatalogModel } from '../models'
 
@@ -308,7 +309,7 @@ export default function GenerationOptions(): JSX.Element {
       return
     }
 
-    fetch(`${apiUrl}/model/params?model_id=${encodeURIComponent(modelId)}`)
+    apiFetch(`${apiUrl}/model/params?model_id=${encodeURIComponent(modelId)}`)
       .then((res) => res.json())
       .then((params: ParamSchema[]) => {
         schemaCache.current[modelId] = params

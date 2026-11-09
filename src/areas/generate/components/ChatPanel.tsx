@@ -7,6 +7,7 @@ import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { useWorkflowRunStore } from '@areas/workflows/workflowRunStore'
 import { buildAllWorkflowExtensions } from '@areas/workflows/mockExtensions'
 import { readAgentEvents } from '@shared/utils/agentStream'
+import { apiFetch } from '@shared/utils/apiRequest'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -372,7 +373,7 @@ export default function ChatPanel(): JSX.Element {
         delete context.workflowCompletion
       }
 
-      const res = await fetch(`${apiUrl}/agent/chat/stream`, {
+      const res = await apiFetch(`${apiUrl}/agent/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

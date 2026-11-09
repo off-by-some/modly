@@ -6,16 +6,13 @@ import re
 import subprocess
 import sys
 import shutil
-import tarfile
-import tempfile
-import uuid
 from pathlib import Path
-from urllib.parse import urlparse
-import httpx
 from fastapi import APIRouter, Body, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["extensions"])
+_install_tasks: set[asyncio.Task] = set()
 
 _SAFE_EXTENSION_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -203,105 +200,63 @@ async def run_process(body: ProcessRun):
     raise HTTPException(500, message)
 
 
-def _extract_github_tarball(payload: bytes, destination: Path) -> None:
-    archive_path = destination.parent / f"{destination.name}.tar.gz"
-    archive_path.write_bytes(payload)
-    try:
-        with tarfile.open(archive_path, "r:gz") as archive:
-            members = archive.getmembers()
-            roots = {member.name.split("/", 1)[0] for member in members if member.name}
-            if len(roots) != 1:
-                raise ValueError("GitHub archive has an unexpected layout")
-            root_name = next(iter(roots))
-            for member in members:
-                relative = member.name.removeprefix(root_name).lstrip("/")
-                if not relative:
-                    continue
-                target = (destination / relative).resolve()
-                if destination.resolve() not in target.parents:
-                    raise ValueError("Archive contains an unsafe path")
-                if member.issym() or member.islnk():
-                    raise ValueError("Archive links are not supported")
-                if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                elif member.isfile():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    source = archive.extractfile(member)
-                    if source is None:
-                        raise ValueError("Could not read archive member")
-                    with source, target.open("wb") as output:
-                        shutil.copyfileobj(source, output)
-    finally:
-        archive_path.unlink(missing_ok=True)
-
-
 @router.post("/install-github")
 async def install_from_github(body: GitHubInstall):
-    parsed = urlparse(body.url.strip())
-    parts = [part for part in parsed.path.split("/") if part]
-    if parsed.scheme != "https" or parsed.hostname != "github.com" or len(parts) < 2:
-        raise HTTPException(400, "Expected a GitHub repository URL")
-    owner, repo = parts[0], parts[1].removesuffix(".git")
-    tarball_url = f"https://api.github.com/repos/{owner}/{repo}/tarball/HEAD"
-    async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
-        response = await client.get(tarball_url, headers={"User-Agent": "Modly-Server"})
-        response.raise_for_status()
+    """Fetch and install on the server, returning newline-delimited SSE progress."""
+    from services.extension_installer import install_github
 
-    root = _extension_root()
-    staging = Path(tempfile.mkdtemp(prefix=".modly-install-", dir=root))
-    backup = None
-    destination = None
-    try:
-        _extract_github_tarball(response.content, staging)
-        manifest_path = staging / "manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict):
-            raise ValueError("manifest.json must contain an object")
-        extension_id = manifest.get("id")
-        if not isinstance(extension_id, str) or not _SAFE_EXTENSION_ID.fullmatch(extension_id):
-            raise ValueError("manifest.json contains an invalid extension id")
-        if not isinstance(manifest.get("nodes"), list) or not manifest["nodes"]:
-            raise ValueError("manifest.json must declare at least one node")
-        manifest["source"] = f"https://github.com/{owner}/{repo}"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        destination = _extension_path(extension_id)
-        backup = root / f".modly-backup-{extension_id}-{uuid.uuid4().hex}"
-        if destination.exists():
-            destination.rename(backup)
-        staging.rename(destination)
+    async def events():
+        queue: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=100)
+        connected = True
+
+        async def emit(event: dict) -> None:
+            if not connected:
+                return
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(event)
+
+        async def run() -> None:
+            try:
+                result = await install_github(body.url, _extension_root(), emit)
+                # The done progress event is emitted by the installer. Send the
+                # full normalized extension as the terminal result.
+                await emit({
+                    "step": "result",
+                    **result,
+                    "extension": _manifest_for_client(result["manifest"]),
+                })
+            except Exception as exc:
+                await emit({"step": "error", "message": str(exc)})
+            finally:
+                if connected:
+                    if queue.full():
+                        queue.get_nowait()
+                    queue.put_nowait(None)
+
+        task = asyncio.create_task(run())
+        _install_tasks.add(task)
+        task.add_done_callback(_install_tasks.discard)
         try:
-            if (destination / "setup.py").exists():
-                await setup_extension(extension_id)
-            elif manifest.get("type") == "process" and (destination / "package.json").exists():
-                result = await asyncio.to_thread(
-                    subprocess.run,
-                    ["npm", "install", "--omit=dev", "--no-audit", "--no-fund"],
-                    cwd=destination, capture_output=True, text=True,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr or "npm install failed")
-            from services.generator_registry import generator_registry
-            await asyncio.to_thread(generator_registry.reload)
-        except Exception:
-            shutil.rmtree(destination, ignore_errors=True)
-            if backup and backup.exists():
-                backup.rename(destination)
-            raise
-        if backup and backup.exists():
-            shutil.rmtree(backup)
-        return {"success": True, "extensionId": extension_id, "extension": _manifest_for_client(manifest)}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(400, str(exc)) from exc
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            # Installation is server-owned and continues if the desktop closes
+            # the progress stream. Startup recovery covers a server shutdown.
+            connected = False
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 @router.delete("/{extension_id}")
 async def uninstall_extension(extension_id: str):
     path = _extension_path(extension_id)
+    from services.builtin_extensions import BUILTIN_MARKER
+    if (path / BUILTIN_MARKER).is_file():
+        raise HTTPException(403, "Built-in extensions are managed by the server")
     if path.exists():
         shutil.rmtree(path)
     from services.generator_registry import generator_registry

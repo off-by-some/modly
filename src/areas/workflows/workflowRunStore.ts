@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import axios, { AxiosInstance } from 'axios'
+import axios, { type AxiosInstance } from 'axios'
 import { useAppStore } from '@shared/stores/appStore'
 import { getWorkflowExtension } from './mockExtensions'
 import { hasUnsupportedSceneShape } from './sceneShape'
@@ -793,7 +793,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       })
 
       try {
-        const client       = axios.create({ baseURL: apiUrl })
+        const apiToken     = useAppStore.getState().apiToken
+        const client       = axios.create({
+          baseURL: apiUrl,
+          headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : undefined,
+        })
         const settings     = await window.electron.settings.get()
         const workspaceDir = settings.workspaceDir.replace(/\\/g, '/')
 
@@ -1081,7 +1085,11 @@ export const useWorkflowRunStore = create<WorkflowRunStore>((set, get) => {
       flushResume()   // unblock a manual While pause so the run can tear down
       if (_activeJobId.current) {
         const apiUrl = useAppStore.getState().apiUrl
-        axios.create({ baseURL: apiUrl }).post(`/generate/cancel/${_activeJobId.current}`).catch(() => {})
+        const apiToken = useAppStore.getState().apiToken
+        axios.create({
+          baseURL: apiUrl,
+          headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : undefined,
+        }).post(`/generate/cancel/${_activeJobId.current}`).catch(() => {})
         _activeJobId.current = null
       }
       _ctx.current = null

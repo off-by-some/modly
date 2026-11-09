@@ -45,7 +45,7 @@ test('checks the normalized health endpoint before accepting a server', async ()
   }
 
   try {
-    assert.equal(await checkBackendServer('modly.local:8765/'), 'http://modly.local:8765')
+    assert.equal(await checkBackendServer('modly.local:8765/', '', true), 'http://modly.local:8765')
     assert.equal(requestedUrl, 'http://modly.local:8765/health')
   } finally {
     globalThis.window = originalWindow
@@ -60,9 +60,22 @@ test('rejects a server with an incompatible health response', async () => {
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ status: 'starting' }) })
 
   try {
-    await assert.rejects(() => checkBackendServer('http://modly.local:8765'), /unexpected health response/)
+    await assert.rejects(() => checkBackendServer('http://modly.local:8765', '', true), /unexpected health response/)
   } finally {
     globalThis.window = originalWindow
     globalThis.fetch = originalFetch
+  }
+})
+
+test('requires explicit consent before sending credentials over remote HTTP', async () => {
+  const originalWindow = globalThis.window
+  globalThis.window = { setTimeout, clearTimeout }
+  try {
+    await assert.rejects(
+      () => checkBackendServer('http://192.168.1.20:8765', 'secret'),
+      /explicitly allow insecure HTTP/,
+    )
+  } finally {
+    globalThis.window = originalWindow
   }
 })

@@ -9,6 +9,7 @@ import { SegmentedControl } from '@shared/ui'
 import { SseProgressBar } from './SseProgressBar'
 import { vramFit } from './vramFit'
 import { agentGrade } from './agentGrade'
+import { apiFetch } from '@shared/utils/apiRequest'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -138,7 +139,7 @@ export function ModelLibraryModal({ onClose }: { onClose: () => void }): JSX.Ele
     void refreshModels()   // shared model catalog (propagates to every picker)
     try {
       const s = await withAbort((signal) =>
-        fetch(`${apiUrl}/llm/status`, { signal }).then((r) => r.json()),
+        apiFetch(`${apiUrl}/llm/status`, { signal }).then((r) => r.json()),
       )
       if (!aliveRef.current) return
       setStatus(s)
@@ -167,7 +168,7 @@ export function ModelLibraryModal({ onClose }: { onClose: () => void }): JSX.Ele
   }
 
   async function handleDelete(id: string) {
-    await fetch(`${apiUrl}/llm/models/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {})
+    await apiFetch(`${apiUrl}/llm/models/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {})
     void refresh()
   }
 

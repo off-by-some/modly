@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
 import { checkBackendServer } from '@shared/utils/backendServer'
+import { useExtensionsStore } from '@shared/stores/extensionsStore'
+import { useWorkflowsStore } from '@shared/stores/workflowsStore'
+import { useLlmModelsStore } from '@shared/stores/llmModelsStore'
 
 const HEALTH_CHECK_INTERVAL_MS = 10_000
 
@@ -10,6 +13,8 @@ export function BackendConnectionMonitor(): JSX.Element | null {
   const setBackendServer = useAppStore((state) => state.setBackendServer)
   const setRemoteBackendStatus = useAppStore((state) => state.setRemoteBackendStatus)
   const showToast = useAppStore((state) => state.showToast)
+  const apiToken = useAppStore((state) => state.apiToken)
+  const allowInsecureRemote = useAppStore((state) => state.allowInsecureRemote)
 
   const [visible, setVisible] = useState(false)
   const [checking, setChecking] = useState(false)
@@ -18,6 +23,7 @@ export function BackendConnectionMonitor(): JSX.Element | null {
   const dismissedForOutage = useRef(false)
   const consecutiveFailures = useRef(0)
   const fallbackInProgress = useRef(false)
+  const automaticFallbackEnabled = useRef(true)
   const checkNow = useRef<() => Promise<boolean>>(async () => false)
 
   useEffect(() => {
@@ -29,6 +35,7 @@ export function BackendConnectionMonitor(): JSX.Element | null {
       setRemoteBackendStatus('unknown')
       consecutiveFailures.current = 0
       fallbackInProgress.current = false
+      automaticFallbackEnabled.current = true
       return
     }
 
@@ -38,7 +45,7 @@ export function BackendConnectionMonitor(): JSX.Element | null {
     const check = async (): Promise<boolean> => {
       setChecking(true)
       try {
-        await checkBackendServer(apiUrl)
+        await checkBackendServer(apiUrl, apiToken, allowInsecureRemote)
         if (cancelled) return false
         setRemoteBackendStatus('online')
         consecutiveFailures.current = 0
@@ -52,12 +59,18 @@ export function BackendConnectionMonitor(): JSX.Element | null {
         consecutiveFailures.current += 1
         setError(cause instanceof Error ? cause.message : 'Could not connect to this Modly server.')
         if (!dismissedForOutage.current) setVisible(true)
-        if (consecutiveFailures.current >= 3 && !fallbackInProgress.current) {
+        if (consecutiveFailures.current >= 3 && automaticFallbackEnabled.current && !fallbackInProgress.current) {
           fallbackInProgress.current = true
           setSwitching(true)
           try {
             await setBackendServer('local')
             if (!cancelled) {
+              const selectedApiUrl = useAppStore.getState().apiUrl
+              await Promise.all([
+                useExtensionsStore.getState().loadExtensions(),
+                useWorkflowsStore.getState().load(),
+                useLlmModelsStore.getState().fetchModels(selectedApiUrl, { force: true }),
+              ])
               const message = 'The custom server went offline. Modly switched to the bundled server.'
               showToast(message, 7000)
               void window.electron.notifications.show('Modly server changed', message)
@@ -91,7 +104,7 @@ export function BackendConnectionMonitor(): JSX.Element | null {
       if (timer !== undefined) window.clearTimeout(timer)
       checkNow.current = async () => false
     }
-  }, [apiUrl, backendMode, setBackendServer, setRemoteBackendStatus, showToast])
+  }, [allowInsecureRemote, apiToken, apiUrl, backendMode, setBackendServer, setRemoteBackendStatus, showToast])
 
   async function handleSwitchToBundled(): Promise<void> {
     setSwitching(true)
@@ -107,6 +120,7 @@ export function BackendConnectionMonitor(): JSX.Element | null {
   }
 
   function handleDismiss(): void {
+    automaticFallbackEnabled.current = false
     dismissedForOutage.current = true
     setVisible(false)
   }

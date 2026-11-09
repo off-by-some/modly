@@ -10,6 +10,7 @@ import { ModelLibraryModal } from '@shared/components/ui/ModelLibraryModal'
 import type { LlmModel } from '@shared/stores/llmModelsStore'
 import { formatBytes } from '@shared/utils/format'
 import { Section, Card, SegmentedControl } from '@shared/ui'
+import { apiFetch } from '@shared/utils/apiRequest'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -150,9 +151,9 @@ export function AgentSection(): JSX.Element {
   const refreshLocal = useCallback(async () => {
     try {
       const [s, m, c] = await Promise.all([
-        fetch(`${apiUrl}/llm/status`).then((r) => r.json()),
-        fetch(`${apiUrl}/llm/models?downloaded=true`).then((r) => r.json()),
-        fetch(`${apiUrl}/llm/config`).then((r) => r.json()),
+        apiFetch(`${apiUrl}/llm/status`).then((r) => r.json()),
+        apiFetch(`${apiUrl}/llm/models?downloaded=true`).then((r) => r.json()),
+        apiFetch(`${apiUrl}/llm/config`).then((r) => r.json()),
       ])
       setEngineInstalled(Boolean(s.binary_installed))
       setModels(m.models ?? [])
@@ -183,7 +184,7 @@ export function AgentSection(): JSX.Element {
   async function changeMaxModels(value: string) {
     setMaxModels(value)
     try {
-      const res = await fetch(`${apiUrl}/llm/config`, {
+      const res = await apiFetch(`${apiUrl}/llm/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ max_models: value === 'auto' ? 'auto' : Number(value) }),
@@ -218,7 +219,7 @@ export function AgentSection(): JSX.Element {
       const base = provider === 'custom' ? baseUrlDraft.trim().replace(/\/$/, '') : PROVIDERS[provider].baseUrl
       // POST, not a query string: a GET would put the API key in the uvicorn
       // access log, which ends up in runtime.log and in users' bug reports.
-      const res = await fetch(`${apiUrl}/agent/external/models`, {
+      const res = await apiFetch(`${apiUrl}/agent/external/models`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ base_url: base, api_key: keyDraft.trim() }),

@@ -112,17 +112,52 @@ async def shared_group_states(extension_id: str):
     return result
 
 
-def _snapshot_source(source: dict, destination: Path, token: str | None) -> None:
-    from huggingface_hub import snapshot_download
+def _download_source(
+    source: dict,
+    destination: Path,
+    token: str | None,
+    control: dict[str, threading.Event],
+    on_progress,
+) -> None:
+    from huggingface_hub import hf_hub_url, list_repo_files
     destination.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=source["repo_id"],
-        revision=source.get("revision"),
-        local_dir=destination,
-        allow_patterns=source.get("include_prefixes") or None,
-        ignore_patterns=source.get("skip_prefixes") or None,
-        token=token,
-    )
+    include = source.get("include_prefixes") or []
+    skip = source.get("skip_prefixes") or []
+    files = [
+        name for name in list_repo_files(
+            source["repo_id"], revision=source.get("revision"), token=token
+        )
+        if not include or any(name.startswith(prefix) for prefix in include)
+        if not any(name.startswith(prefix) for prefix in skip)
+    ]
+    if not files:
+        raise RuntimeError(f'No files matched the configured prefixes in {source["repo_id"]}')
+    for index, filename in enumerate(files, 1):
+        _check_managed_download(control)
+        try:
+            _download_file_streamed(
+                url=hf_hub_url(
+                    repo_id=source["repo_id"],
+                    filename=filename,
+                    revision=source.get("revision"),
+                ),
+                filename=filename,
+                dest_dir=str(destination),
+                file_index=index,
+                total_files=len(files),
+                base_percent=0,
+                progress_cb=lambda message, i=index: on_progress(
+                    i, len(files), filename, message.get("percent", 0)
+                ),
+                control=control,
+                token=token,
+            )
+        except DownloadPaused as exc:
+            raise ManagedDownloadPaused() from exc
+        except DownloadCancelled as exc:
+            raise ManagedDownloadCancelled() from exc
+        on_progress(index, len(files), filename, 100)
+        _check_managed_download(control)
 
 
 class ManagedDownloadPaused(Exception):
@@ -133,7 +168,7 @@ class ManagedDownloadCancelled(Exception):
     pass
 
 
-_managed_download_controls: dict[str, dict[str, threading.Event]] = {}
+_managed_download_controls: dict[str, dict] = {}
 
 
 def _check_managed_download(control: dict[str, threading.Event]) -> None:
@@ -154,16 +189,41 @@ async def managed_download(model_id: str, variant_id: str | None = None):
     root = _model_root(model_id)
     if model_id in _managed_download_controls:
         raise HTTPException(409, "Download already in progress")
-    control = {"pause": threading.Event(), "cancel": threading.Event()}
+    control = {
+        "pause": threading.Event(),
+        "cancel": threading.Event(),
+        "percent": 0,
+        "status": "Listing server download…",
+    }
     _managed_download_controls[model_id] = control
 
     def download() -> None:
+        completed_sources = 0
+        source_count = sum(
+            len(group.get("model_sources", []) or [])
+            for group in manifest.get("weight_groups", []) or []
+        ) + len(manifest.get("model_sources", []) or [])
+        if not isinstance(manifest.get("model_sources"), list) and manifest.get("hf_repo"):
+            source_count += 2 if isinstance(manifest.get("weight_variants"), dict) else 1
+
+        def download_source(source: dict, destination: Path) -> None:
+            nonlocal completed_sources
+            start = completed_sources / max(1, source_count)
+
+            def report(index: int, total: int, filename: str, file_percent: int) -> None:
+                completed_files = (index - 1 + max(0, min(100, file_percent)) / 100) / total
+                control["percent"] = round((start + completed_files / max(1, source_count)) * 100)
+                control["status"] = f"Downloading {filename}"
+
+            _download_source(source, destination, token, control, report)
+            completed_sources += 1
+
         for group in manifest.get("weight_groups", []) or []:
             group_root = registry_module.MODELS_DIR / extension_id / "_shared" / group["id"]
             for source in group.get("model_sources", []) or []:
                 _check_managed_download(control)
                 destination = group_root / source.get("destination", ".")
-                _snapshot_source(source, destination, token)
+                download_source(source, destination)
                 _check_managed_download(control)
 
         sources = manifest.get("model_sources")
@@ -171,7 +231,7 @@ async def managed_download(model_id: str, variant_id: str | None = None):
             for source in sources:
                 _check_managed_download(control)
                 destination = root / source.get("destination", ".")
-                _snapshot_source(source, destination, token)
+                download_source(source, destination)
                 _check_managed_download(control)
             return
 
@@ -197,15 +257,15 @@ async def managed_download(model_id: str, variant_id: str | None = None):
                 "skip_prefixes": [*skip, *variant_prefixes],
             }
             _check_managed_download(control)
-            _snapshot_source(common_source, root, token)
+            download_source(common_source, root)
             _check_managed_download(control)
             include = options[0].get("include_prefixes", [])
         _check_managed_download(control)
-        _snapshot_source({
+        download_source({
             "repo_id": repo_id,
             "include_prefixes": include,
             "skip_prefixes": skip,
-        }, root, token)
+        }, root)
         _check_managed_download(control)
 
     try:
@@ -213,6 +273,9 @@ async def managed_download(model_id: str, variant_id: str | None = None):
     except ManagedDownloadPaused:
         return {"success": False, "paused": True}
     except ManagedDownloadCancelled:
+        extension_root = registry_module.MODELS_DIR / extension_id
+        for partial in extension_root.rglob("*.part") if extension_root.exists() else []:
+            partial.unlink(missing_ok=True)
         return {"success": False, "cancelled": True}
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
@@ -224,7 +287,14 @@ async def managed_download(model_id: str, variant_id: str | None = None):
 
 @router.get("/managed-downloads")
 async def managed_downloads():
-    return [{"modelId": model_id, "percent": 1, "status": "Downloading on server…"} for model_id in _managed_download_controls]
+    return [
+        {
+            "modelId": model_id,
+            "percent": control.get("percent", 0),
+            "status": control.get("status", "Downloading on server…"),
+        }
+        for model_id, control in _managed_download_controls.items()
+    ]
 
 
 @router.post("/managed-download/pause")
@@ -438,11 +508,11 @@ async def hf_download_sources(request: FastAPIRequest, model_id: str):
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    authorization = request.headers.get("authorization", "")
+    # Authorization authenticates the Modly server itself. Hugging Face has a
+    # separate header so the two credentials can never be confused or logged.
     hf_token = (
-        authorization[7:].strip()
-        if authorization.lower().startswith("bearer ")
-        else os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        request.headers.get("x-hf-token")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         or os.environ.get("HF_TOKEN")
         or None
     )

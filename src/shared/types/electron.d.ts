@@ -190,7 +190,8 @@ declare global {
         setZoomFactor: (factor: number) => void
       }
       backend: {
-        select: (apiUrl: string) => Promise<{ apiUrl: string }>
+        check: (apiUrl: string, token?: string) => Promise<{ apiUrl: string }>
+        select: (apiUrl: string, token?: string) => Promise<{ apiUrl: string }>
       }
       python: {
         start:     () => Promise<{ success: boolean; port?: number; error?: string }>

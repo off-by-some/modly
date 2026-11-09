@@ -30,13 +30,36 @@ export function normalizeBackendUrl(value: string): string {
   return `${url.origin}${path === '/' ? '' : path}`
 }
 
-export async function checkBackendServer(value: string, timeoutMs = 5_000): Promise<string> {
+export function assertBackendTransportAllowed(baseUrl: string, allowInsecureRemote: boolean): void {
+  const parsed = new URL(baseUrl)
+  const isLoopback = parsed.hostname === 'localhost'
+    || parsed.hostname === '127.0.0.1'
+    || parsed.hostname === '[::1]'
+  if (parsed.protocol === 'http:' && !isLoopback && !allowInsecureRemote) {
+    throw new Error('Remote HTTP sends the access token unencrypted. Use HTTPS or explicitly allow insecure HTTP.')
+  }
+}
+
+export async function checkBackendServer(
+  value: string,
+  token = '',
+  allowInsecureRemote = false,
+  timeoutMs = 5_000,
+): Promise<string> {
   const baseUrl = normalizeBackendUrl(value)
+  assertBackendTransportAllowed(baseUrl, allowInsecureRemote)
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
 
   try {
-    const response = await fetch(`${baseUrl}/health`, { signal: controller.signal })
+    if (window.electron?.backend?.check) {
+      const result = await window.electron.backend.check(baseUrl, token.trim())
+      return normalizeBackendUrl(result.apiUrl)
+    }
+    const response = await fetch(`${baseUrl}/health`, {
+      signal: controller.signal,
+      headers: token.trim() ? { Authorization: `Bearer ${token.trim()}` } : undefined,
+    })
     if (!response.ok) throw new Error(`Server returned HTTP ${response.status}.`)
 
     const data = await response.json() as { status?: string }

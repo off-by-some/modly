@@ -59,8 +59,10 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
 
     // Python / FastAPI bridge
     backend: {
-      select: (apiUrl: string): Promise<{ apiUrl: string }> =>
-        ipcRenderer.invoke('backend:select', apiUrl) as Promise<{ apiUrl: string }>,
+      check: (apiUrl: string, token = ''): Promise<{ apiUrl: string }> =>
+        ipcRenderer.invoke('backend:check', apiUrl, token) as Promise<{ apiUrl: string }>,
+      select: (apiUrl: string, token = ''): Promise<{ apiUrl: string }> =>
+        ipcRenderer.invoke('backend:select', apiUrl, token) as Promise<{ apiUrl: string }>,
     },
 
     python: {

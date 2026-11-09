@@ -3,8 +3,12 @@ import { useAppStore, GenerationOptions } from '@shared/stores/appStore'
 
 export function useApi() {
   const apiUrl = useAppStore((s) => s.apiUrl)
+  const apiToken = useAppStore((s) => s.apiToken)
 
-  const client = axios.create({ baseURL: apiUrl })
+  const client = axios.create({
+    baseURL: apiUrl,
+    headers: apiToken ? { Authorization: `Bearer ${apiToken}` } : undefined,
+  })
 
   async function generateFromImage(
     imagePath: string,

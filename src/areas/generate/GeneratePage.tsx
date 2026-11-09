@@ -4,6 +4,7 @@ import { useAppStore, DEFAULT_LIGHT_SETTINGS } from '@shared/stores/appStore'
 import type { GenerationJob, LightSettings, PointLight } from '@shared/stores/appStore'
 import { useApi } from '@shared/hooks/useApi'
 import { ColorPicker } from '@shared/components/ui'
+import { apiFetch } from '@shared/utils/apiRequest'
 import GenerationHUD from './components/GenerationHUD'
 import Viewer3D from './components/Viewer3D'
 import WorkflowPanel from './components/WorkflowPanel'
@@ -762,18 +763,23 @@ export default function GeneratePage(): JSX.Element {
     setTimeout(() => setUnloadStatus('idle'), 2000)
   }
 
-  function handleExport(format: 'glb' | 'obj' | 'stl' | 'ply') {
+  async function handleExport(format: 'glb' | 'obj' | 'stl' | 'ply') {
     if (!currentJob?.outputUrl) return
     const stem = `modly-${Date.now()}`
-    const link = document.createElement('a')
-    if (format === 'glb') {
-      link.href = `${apiUrl}${currentJob.outputUrl}`
-    } else {
-      const path = encodeURIComponent(currentJob.outputUrl.replace('/workspace/', ''))
-      link.href = `${apiUrl}/optimize/export?path=${path}&format=${format}`
+    const sourceUrl = format === 'glb'
+      ? `${apiUrl}${currentJob.outputUrl}`
+      : `${apiUrl}/optimize/export?path=${encodeURIComponent(currentJob.outputUrl.replace('/workspace/', ''))}&format=${format}`
+    const response = await apiFetch(sourceUrl)
+    if (!response.ok) {
+      showError(`Export failed: server returned HTTP ${response.status}.`)
+      return
     }
+    const objectUrl = URL.createObjectURL(await response.blob())
+    const link = document.createElement('a')
+    link.href = objectUrl
     link.download = `${stem}.${format}`
     link.click()
+    URL.revokeObjectURL(objectUrl)
   }
 
   async function handleOpenInOrcaSlicer() {

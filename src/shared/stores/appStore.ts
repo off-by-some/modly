@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { checkBackendServer, normalizeBackendUrl, type BackendMode } from '../utils/backendServer'
+import { assertBackendTransportAllowed, checkBackendServer, normalizeBackendUrl, type BackendMode } from '../utils/backendServer'
 
 export type UiScale = 'small' | 'medium' | 'large' | 'very-large'
 export type BackendStatus = 'not_started' | 'starting' | 'ready' | 'error'
@@ -89,9 +89,13 @@ interface AppState {
   backendError: string | null
   backendMode: BackendMode
   remoteApiUrl: string
+  /** Plaintext exists only in memory; the persisted value is OS-encrypted. */
+  apiToken: string
+  remoteApiTokenEncrypted: string
+  allowInsecureRemote: boolean
   remoteBackendStatus: RemoteBackendStatus
   setRemoteBackendStatus: (status: RemoteBackendStatus) => void
-  setBackendServer: (mode: BackendMode, remoteUrl?: string) => Promise<void>
+  setBackendServer: (mode: BackendMode, remoteUrl?: string, token?: string, allowInsecure?: boolean) => Promise<void>
 
   // Current generation
   currentJob: GenerationJob | null
@@ -179,10 +183,13 @@ export const useAppStore = create<AppState>()(
       backendError: null,
       backendMode: 'local',
       remoteApiUrl: '',
+      apiToken: '',
+      remoteApiTokenEncrypted: '',
+      allowInsecureRemote: false,
       remoteBackendStatus: 'unknown',
       setRemoteBackendStatus: (status) => set({ remoteBackendStatus: status }),
 
-      setBackendServer: async (mode, remoteUrl = '') => {
+      setBackendServer: async (mode, remoteUrl = '', token = '', allowInsecure = false) => {
         const resetServerState = {
           currentJob: null,
           meshHistory: [],
@@ -191,9 +198,21 @@ export const useAppStore = create<AppState>()(
           meshSelected: false,
         }
         if (mode === 'remote') {
-          const apiUrl = await checkBackendServer(remoteUrl)
-          await window.electron.backend.select(apiUrl)
-          set({ ...resetServerState, backendMode: 'remote', remoteApiUrl: apiUrl, remoteBackendStatus: 'online', apiUrl, backendError: null })
+          const apiToken = token.trim()
+          const apiUrl = await checkBackendServer(remoteUrl, apiToken, allowInsecure)
+          const remoteApiTokenEncrypted = apiToken ? await window.electron.secureStore.encrypt(apiToken) : ''
+          await window.electron.backend.select(apiUrl, apiToken)
+          set({
+            ...resetServerState,
+            backendMode: 'remote',
+            remoteApiUrl: apiUrl,
+            remoteApiTokenEncrypted,
+            apiToken,
+            allowInsecureRemote: allowInsecure,
+            remoteBackendStatus: 'online',
+            apiUrl,
+            backendError: null,
+          })
           return
         }
 
@@ -201,7 +220,7 @@ export const useAppStore = create<AppState>()(
         if (!result.success) throw new Error(result.error ?? 'Failed to start the bundled server')
         const { apiUrl } = await window.electron.app.info()
         await window.electron.backend.select(apiUrl)
-        set({ ...resetServerState, backendMode: 'local', remoteBackendStatus: 'unknown', apiUrl, backendError: null })
+        set({ ...resetServerState, backendMode: 'local', apiToken: '', remoteBackendStatus: 'unknown', apiUrl, backendError: null })
       },
 
       setupStatus: 'idle',
@@ -318,12 +337,16 @@ export const useAppStore = create<AppState>()(
         })
 
         try {
-          const { backendMode, remoteApiUrl } = get()
+          const { backendMode, remoteApiUrl, remoteApiTokenEncrypted, allowInsecureRemote } = get()
           if (backendMode === 'remote' && remoteApiUrl) {
             try {
               const apiUrl = normalizeBackendUrl(remoteApiUrl)
-              await window.electron.backend.select(apiUrl)
-              set({ backendStatus: 'ready', remoteBackendStatus: 'unknown', apiUrl })
+              assertBackendTransportAllowed(apiUrl, allowInsecureRemote)
+              const apiToken = remoteApiTokenEncrypted
+                ? (await window.electron.secureStore.decrypt(remoteApiTokenEncrypted) ?? '')
+                : ''
+              await window.electron.backend.select(apiUrl, apiToken)
+              set({ backendStatus: 'ready', remoteBackendStatus: 'unknown', apiUrl, apiToken })
               return
             } catch {
               // A malformed persisted value should never prevent access to Settings.
@@ -365,6 +388,8 @@ export const useAppStore = create<AppState>()(
         lightSettings: state.lightSettings,
         backendMode: state.backendMode,
         remoteApiUrl: state.remoteApiUrl,
+        remoteApiTokenEncrypted: state.remoteApiTokenEncrypted,
+        allowInsecureRemote: state.allowInsecureRemote,
       }),
     }
   )

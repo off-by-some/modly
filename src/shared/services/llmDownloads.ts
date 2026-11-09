@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { useAppStore } from '@shared/stores/appStore'
+import { apiFetch } from '@shared/utils/apiRequest'
 
 // GGUF model downloads must survive the Model Library modal being closed and
 // reopened — the backend already keeps downloading in the background once
@@ -19,7 +20,7 @@ export interface SseEvent {
 
 /** Reads one SSE `data: {...}` frame at a time and calls `onEvent` for each. */
 export async function consumeSse(url: string, onEvent: (data: SseEvent) => void, signal?: AbortSignal): Promise<void> {
-  const res = await fetch(url, { signal })
+  const res = await apiFetch(url, { signal })
   if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
@@ -89,12 +90,12 @@ export const useLlmDownloadsStore = create<LlmDownloadsStore>((set) => ({
 
   async pause(modelId) {
     const apiUrl = useAppStore.getState().apiUrl
-    await fetch(`${apiUrl}/llm/download/pause?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' }).catch(() => {})
+    await apiFetch(`${apiUrl}/llm/download/pause?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' }).catch(() => {})
   },
 
   async cancel(modelId) {
     const apiUrl = useAppStore.getState().apiUrl
-    await fetch(`${apiUrl}/llm/download/cancel?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' }).catch(() => {})
+    await apiFetch(`${apiUrl}/llm/download/cancel?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' }).catch(() => {})
     // A paused download has no live watcher to hit its .finally cleanup — drop
     // the row here so Cancel visibly clears it.
     set((s) => ({ downloads: { ...s.downloads, [modelId]: undefined } }))
