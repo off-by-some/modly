@@ -9,17 +9,24 @@ const ipcCode = transformSync(readFileSync('electron/main/ipc-handlers.ts', 'utf
   format: 'cjs',
 }).code
 
-function fixture() {
+function fixture({ lostDownloadResponse = false } = {}) {
   const handlers = new Map()
   const calls = []
   const events = []
   const savedSettings = []
+  let managedDownloadPolls = 0
   const axios = {
     interceptors: { request: { use: () => {} } },
     isAxiosError: () => false,
     get: async (url) => {
       calls.push(['get', url])
-      if (url.endsWith('/model/managed-downloads')) return { data: [] }
+      if (url.endsWith('/model/managed-downloads')) {
+        managedDownloadPolls += 1
+        if (lostDownloadResponse && managedDownloadPolls === 1) {
+          return { data: [{ modelId: 'demo/a', percent: 98, status: 'Downloading final file' }] }
+        }
+        return { data: [] }
+      }
       if (url.endsWith('/model/all')) return { data: [{ id: 'demo/a', name: 'Demo', downloaded: true }] }
       if (url.includes('/model/storage/')) {
         return { data: { downloaded: true, hasLocalData: true, installedWeightVariants: ['fast'] } }
@@ -36,6 +43,11 @@ function fixture() {
     post: async (url, body, config) => {
       calls.push(['post', url, body, config])
       if (url.endsWith('/model/managed-download')) {
+        if (lostDownloadResponse) {
+          return new Promise((_resolve, reject) => {
+            config.signal.addEventListener('abort', () => reject(new Error('cancelled')))
+          })
+        }
         return { data: { success: true, progress: { percent: 100, logs: ['done'] } } }
       }
       return { data: {} }
@@ -88,6 +100,7 @@ function fixture() {
     console,
     Buffer,
     URL,
+    AbortController,
     setTimeout,
     clearTimeout,
   })
@@ -108,6 +121,20 @@ test('bundled-mode model downloads are owned by the selected server', async () =
   assert.equal((await f.invoke('model:download', 'demo/a')).success, true)
   assert.ok(f.calls.some(([method, url]) => method === 'post' && url === 'http://test/model/managed-download'))
   assert.ok(f.events.some(([name, progress]) => name === 'model:downloadProgress' && progress.percent === 100))
+})
+
+test('completed server download clears stale progress when the POST response is lost', async () => {
+  const f = fixture({ lostDownloadResponse: true })
+  assert.equal((await f.invoke('model:download', 'demo/a')).success, true)
+  assert.ok(f.events.some(([name, progress]) => (
+    name === 'model:downloadProgress' && progress.percent === 98
+  )))
+  assert.ok(f.events.some(([name, progress]) => (
+    name === 'model:downloadProgress' && progress.percent === 100 && progress.status === 'done'
+  )))
+  assert.ok(f.calls.some(([method, url]) => (
+    method === 'get' && url === 'http://test/model/storage/demo%2Fa/state'
+  )))
 })
 
 test('bundled-mode model deletion and state checks use server storage routes', async () => {

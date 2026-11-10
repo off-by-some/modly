@@ -35,6 +35,7 @@ from services.extension_runtime import (
     remove_extension_image,
     runtime_settings,
     write_extension_runtime,
+    setup_gpu_evidence,
 )
 from services.upload_limits import optional_env_limit
 
@@ -83,6 +84,7 @@ def extension_setup_environment(
     """
     env = dict(os.environ)
     env["MODLY_TORCH_FLAVOR"] = flavor
+    env["PYTHONUNBUFFERED"] = "1"
     env["MODLY_TORCH_INDEX_URL"] = torch_index_url
     env["MODLY_TORCH_SPECS"] = json.dumps(torch_specs or [])
     if flavor == "cuda" and "PIP_EXTRA_INDEX_URL" not in env:
@@ -345,17 +347,16 @@ async def _setup_extension(extension_dir: Path, manifest: dict, entry: str, prog
         args = json.dumps({
             "python_exe": sys.executable,
             "ext_dir": str(extension_dir),
-            "gpu_sm": gpu_sm,
-            "cuda_version": cuda_version,
             "accelerator": flavor,
             "torch_flavor": flavor,
             "gfx_target": gfx_target,
             "torch_index_url": torch_index_url,
             "platform": sys.platform,
             "arch": _node_arch(),
+            **setup_gpu_evidence(gpu_sm, cuda_version),
         })
         await _run_command(
-            [sys.executable, str(setup_py), args],
+            [sys.executable, "-u", str(setup_py), args],
             extension_dir,
             progress,
             "Setting up Python environment",

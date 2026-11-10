@@ -14,6 +14,7 @@ from services.extension_runtime import (
     extension_is_visible,
     infer_python_version,
     recommended_cuda_lane,
+    setup_gpu_evidence,
     set_docker_enabled,
     write_extension_runtime,
 )
@@ -84,9 +85,21 @@ class ExtensionRuntimeTests(unittest.TestCase):
             self.assertNotIn("RUN python setup.py", dockerfile)
 
             setup_script = docker_setup_script(extension, 86, 124)
-            self.assertIn("python setup.py", setup_script)
+            self.assertIn("python -u setup.py", setup_script)
             self.assertIn('"gpu_sm": 86', setup_script)
             self.assertIn("venv/bin/python", setup_script)
+            self.assertIn('exec \"%s\" \"$@\"', setup_script)
+            self.assertNotIn('ln -sf \"$python_path\"', setup_script)
+
+            cpu_script = docker_setup_script(extension, 0, 0)
+            self.assertNotIn('"gpu_sm"', cpu_script)
+            self.assertNotIn('"cuda_version"', cpu_script)
+
+    def test_setup_gpu_evidence_is_complete_or_absent(self):
+        self.assertEqual(setup_gpu_evidence(86, 128), {"gpu_sm": 86, "cuda_version": 128})
+        self.assertEqual(setup_gpu_evidence("86", "12.8"), {"gpu_sm": 86, "cuda_version": 128})
+        self.assertEqual(setup_gpu_evidence(0, 0), {})
+        self.assertEqual(setup_gpu_evidence("", ""), {})
 
     def test_docker_gpu_arguments_support_runtime_and_cdi(self):
         self.assertEqual(docker_gpu_arguments("runtime"), ["--gpus", "all"])

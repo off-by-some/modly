@@ -395,9 +395,14 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
         error: unknown
         data: ManagedDownloadResponse | null
       } = { settled: false, error: null, data: null }
+      const requestController = new AbortController()
+      let lastProgress: (DownloadProgress & { logs?: string[] }) | undefined
+      let missingPolls = 0
+      let reconciledComplete = false
       const request = axios.post(`${apiUrl}/model/managed-download`, null, {
         params: { model_id: modelId, variant_id: variantId },
         timeout: 0,
+        signal: requestController.signal,
       }).then((response) => { requestState.data = response.data })
         .catch((error) => { requestState.error = error })
         .finally(() => { requestState.settled = true })
@@ -411,10 +416,45 @@ export function setupIpcHandlers(pythonBridge: PythonBridge, getWindow: WindowGe
             logs?: string[]
           }>>(`${apiUrl}/model/managed-downloads`, { timeout: 5_000 })
           const progress = response.data.find((candidate) => candidate.modelId === modelId)
-          if (progress) event.sender.send('model:downloadProgress', progress)
+          if (progress) {
+            lastProgress = progress
+            missingPolls = 0
+            event.sender.send('model:downloadProgress', progress)
+          } else {
+            missingPolls += 1
+            // The download POST can lose its response while the server-owned
+            // job still finishes successfully. Once an observed job vanishes
+            // (or two initial polls find none), reconcile against authoritative
+            // server storage instead of leaving the UI at its last percentage.
+            if (lastProgress || missingPolls >= 2) {
+              const { data: state } = await axios.get<{
+                downloaded?: boolean
+                installedWeightVariants?: string[] | null
+              }>(`${apiUrl}/model/storage/${encodeURIComponent(modelId)}/state`, { timeout: 10_000 })
+              const variantReady = variantId
+                ? state.installedWeightVariants?.includes(variantId) === true
+                : Boolean(state.downloaded)
+              if (variantReady) {
+                reconciledComplete = true
+                requestController.abort()
+                break
+              }
+            }
+          }
         } catch {
           // The blocking server request remains authoritative through transient polls.
         }
+      }
+      if (reconciledComplete) {
+        event.sender.send('model:downloadProgress', {
+          modelId,
+          variantId,
+          percent: 100,
+          status: 'done',
+          logs: lastProgress?.logs,
+        })
+        notifyWeightChange()
+        return { success: true }
       }
       await request
       if (requestState.error) throw requestState.error

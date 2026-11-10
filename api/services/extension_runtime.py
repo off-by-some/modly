@@ -263,6 +263,23 @@ def recommended_cuda_lane(gpu_sm: str | int, detected_cuda: str | int) -> int:
     return int(match.group(1)) * 10 + int(match.group(2)) if match else 0
 
 
+def setup_gpu_evidence(gpu_sm: str | int, cuda_version: str | int) -> dict[str, int]:
+    """Return complete setup GPU evidence, or omit it when no NVIDIA GPU exists."""
+    try:
+        sm = int(gpu_sm)
+    except (TypeError, ValueError):
+        return {}
+    value = str(cuda_version).strip()
+    if value.isdigit():
+        cuda = int(value)
+    else:
+        match = re.fullmatch(r"(\d+)\.(\d+)", value)
+        cuda = int(match.group(1)) * 10 + int(match.group(2)) if match else 0
+    if sm <= 0 or cuda < 100:
+        return {}
+    return {"gpu_sm": sm, "cuda_version": cuda}
+
+
 def docker_image_name(
     extension_dir: Path,
     manifest: dict,
@@ -320,7 +337,7 @@ def dockerfile_for_extension(
     if setup:
         setup += "\n"
     return f"""FROM python:{python_version}-slim-bookworm
-ENV DEBIAN_FRONTEND=noninteractive PYTHONUTF8=1 PYTHONIOENCODING=utf-8 PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUTF8=1 PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 PIP_DISABLE_PIP_VERSION_CHECK=1
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake git libgl1 libglib2.0-0 libgomp1 ninja-build nodejs npm && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/modly/extension
 COPY . .
@@ -347,21 +364,26 @@ def docker_setup_script(
         payload = json.dumps({
             "python_exe": "/usr/local/bin/python",
             "ext_dir": "/opt/modly/extension",
-            "gpu_sm": gpu_sm,
-            "cuda_version": cuda_version,
             "accelerator": accelerator,
             "torch_flavor": accelerator,
             "gfx_target": "",
             "torch_index_url": "",
             "platform": "linux",
             "arch": "x64" if platform.machine().lower() in {"x86_64", "amd64"} else "arm64",
+            **setup_gpu_evidence(gpu_sm, cuda_version),
         })
-        steps.append(f"python setup.py {shlex.quote(payload)}")
+        steps.append(f"python -u setup.py {shlex.quote(payload)}")
     steps.extend([
         "python_path=/usr/local/bin/python",
         "if [ -x venv/bin/python ]; then python_path=/opt/modly/extension/venv/bin/python; "
         "elif [ -x .venv/bin/python ]; then python_path=/opt/modly/extension/.venv/bin/python; fi",
-        'ln -sf "$python_path" /opt/modly/runtime-python',
+        # Python discovers pyvenv.cfg from the invoked executable path. An
+        # external symlink such as /opt/modly/runtime-python -> venv/bin/python
+        # therefore runs with the base prefix and cannot see the venv packages.
+        # Use a wrapper that invokes the selected interpreter by its real path.
+        "rm -f /opt/modly/runtime-python",
+        "printf '#!/bin/sh\\nexec \"%s\" \"$@\"\\n' \"$python_path\" > /opt/modly/runtime-python",
+        "chmod 0755 /opt/modly/runtime-python",
     ])
     return "; ".join(steps)
 
