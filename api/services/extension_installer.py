@@ -24,7 +24,9 @@ from services.builtin_extensions import BUILTIN_MARKER
 from services.extension_runtime import (
     RUNTIME_MARKER,
     docker_capabilities,
+    docker_gpu_arguments,
     docker_image_name,
+    docker_setup_script,
     dockerfile_for_extension,
     extension_runtime,
     infer_python_version,
@@ -277,7 +279,11 @@ async def _run_command(
         env={**(env or os.environ), "PYTHONUTF8": "1"},
     )
     assert process.stdout is not None
-    output_lines: deque[str] = deque(maxlen=500)
+    # Docker setup can emit several hundred lines after the actual nested pip
+    # failure (for example, a structured setup report followed by BuildKit's
+    # summary). Retain enough context for the terminal event to include the
+    # original cause instead of only the outer `docker build` error.
+    output_lines: deque[str] = deque(maxlen=2000)
 
     async def consume() -> None:
         while line := await process.stdout.readline():
@@ -382,6 +388,9 @@ async def _setup_docker_extension(
     cuda_version = recommended_cuda_lane(gpu_sm, detected_cuda)
     python_version = infer_python_version(extension_dir, manifest)
     image = docker_image_name(extension_dir, manifest)
+    has_python_setup = (extension_dir / "setup.py").is_file()
+    bootstrap_image = f"{image}-bootstrap" if has_python_setup else image
+    docker = shutil.which("docker") or "docker"
     dockerfile = dockerfile_for_extension(
         extension_dir,
         manifest,
@@ -414,7 +423,7 @@ async def _setup_docker_extension(
                 "--progress",
                 "plain",
                 "--tag",
-                image,
+                bootstrap_image,
                 "--file",
                 str(dockerfile_path),
                 ".",
@@ -423,6 +432,61 @@ async def _setup_docker_extension(
             progress,
             f"Building Docker runtime (Python {python_version})",
         )
+
+    if has_python_setup:
+        safe_id = re.sub(
+            r"[^a-z0-9_.-]+", "-", str(manifest.get("id", extension_dir.name)).lower()
+        )[:32]
+        container_name = f"modly-extension-setup-{safe_id}-{uuid.uuid4().hex[:12]}"
+        setup_script = docker_setup_script(extension_dir, gpu_sm, cuda_version)
+
+        def cleanup(command: list[str]) -> None:
+            try:
+                subprocess.run(
+                    command,
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        try:
+            await _run_command(
+                [
+                    docker,
+                    "run",
+                    "--name",
+                    container_name,
+                    *docker_gpu_arguments(str(capabilities.get("nvidiaContainerMode", ""))),
+                    bootstrap_image,
+                    "/bin/sh",
+                    "-c",
+                    setup_script,
+                ],
+                extension_dir,
+                progress,
+                "Preparing Docker runtime with extension setup",
+            )
+            await _run_command(
+                [
+                    docker,
+                    "commit",
+                    "--change",
+                    'CMD ["/opt/modly/runtime-python", "/modly/api/runner.py"]',
+                    container_name,
+                    image,
+                ],
+                extension_dir,
+                progress,
+                "Finalizing Docker runtime",
+            )
+        except BaseException:
+            await asyncio.to_thread(remove_extension_image, {"image": image})
+            raise
+        finally:
+            await asyncio.to_thread(cleanup, [docker, "container", "rm", "--force", container_name])
+            await asyncio.to_thread(cleanup, [docker, "image", "rm", bootstrap_image])
 
     metadata = {
         "kind": "docker",

@@ -6,8 +6,10 @@ from unittest.mock import patch
 
 from services.extension_runtime import (
     docker_capabilities,
+    docker_gpu_arguments,
     docker_image_name,
     docker_run_prefix,
+    docker_setup_script,
     dockerfile_for_extension,
     extension_is_visible,
     infer_python_version,
@@ -79,6 +81,20 @@ class ExtensionRuntimeTests(unittest.TestCase):
             self.assertIn("PIP_EXTRA_INDEX_URL=https://pypi.org/simple", dockerfile)
             self.assertIn("npm install --omit=dev", dockerfile)
             self.assertIn("esbuild", dockerfile)
+            self.assertNotIn("RUN python setup.py", dockerfile)
+
+            setup_script = docker_setup_script(extension, 86, 124)
+            self.assertIn("python setup.py", setup_script)
+            self.assertIn('"gpu_sm": 86', setup_script)
+            self.assertIn("venv/bin/python", setup_script)
+
+    def test_docker_gpu_arguments_support_runtime_and_cdi(self):
+        self.assertEqual(docker_gpu_arguments("runtime"), ["--gpus", "all"])
+        self.assertEqual(
+            docker_gpu_arguments("cdi"),
+            ["--device", "nvidia.com/gpu=all"],
+        )
+        self.assertEqual(docker_gpu_arguments(""), [])
 
     def test_cuda_lane_preserves_setup_contract_and_image_tags_are_transactional(self):
         with tempfile.TemporaryDirectory() as temporary:

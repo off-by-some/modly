@@ -237,7 +237,10 @@ async function installExtension(
     }
 }
 
-const MAX_INSTALL_LOG_LINES = 500
+// Large Docker installs can print a structured extension failure followed by
+// hundreds of BuildKit summary lines. Keep enough history for the UI to retain
+// the underlying pip/runtime error, not just Docker's final exit-code wrapper.
+const MAX_INSTALL_LOG_LINES = 2000
 
 function appendInstallLog(current: string[], text?: string): string[] {
   if (!text) return current

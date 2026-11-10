@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -108,8 +109,8 @@ def docker_capabilities(root: Path) -> dict:
     container_mode = ""
     if available:
         ok, runtimes = _run_probe([docker, "info", "--format", "{{json .Runtimes}}"])
-        # Legacy NVIDIA Container Runtime configuration. This is the path used
-        # by `docker run --gpus all` and remains the most widely deployed mode.
+        # NVIDIA Container Toolkit can register an NVIDIA runtime with Docker;
+        # this is the path used by `docker run --gpus all`.
         if ok and "nvidia" in runtimes.lower():
             toolkit_installed = True
             container_mode = "runtime"
@@ -315,6 +316,34 @@ def dockerfile_for_extension(
         accelerator = "cuda" if gpu_sm else "cpu"
         if accelerator == "cuda":
             accelerator_environment = "ENV PIP_EXTRA_INDEX_URL=https://pypi.org/simple MODLY_TORCH_FLAVOR=cuda\n"
+    setup = "\n".join(setup_steps)
+    if setup:
+        setup += "\n"
+    return f"""FROM python:{python_version}-slim-bookworm
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUTF8=1 PYTHONIOENCODING=utf-8 PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake git libgl1 libglib2.0-0 libgomp1 ninja-build nodejs npm && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/modly/extension
+COPY . .
+{accelerator_environment}{setup}RUN ln -sf /usr/local/bin/python /opt/modly/runtime-python
+CMD ["/opt/modly/runtime-python", "/modly/api/runner.py"]
+"""
+
+
+def docker_setup_script(
+    extension_dir: Path,
+    gpu_sm: str | int,
+    cuda_version: int,
+) -> str:
+    """Return setup commands for a temporary, optionally GPU-enabled container.
+
+    Docker build steps cannot normally access NVIDIA devices. Some extensions
+    validate their CUDA runtime from setup.py, so setup must run in a container
+    instead of a Dockerfile layer. The prepared container is committed as the
+    final runtime image by the installer.
+    """
+    steps = ["set -eu"]
+    if (extension_dir / "setup.py").is_file():
+        accelerator = "cuda" if gpu_sm else "cpu"
         payload = json.dumps({
             "python_exe": "/usr/local/bin/python",
             "ext_dir": "/opt/modly/extension",
@@ -327,18 +356,22 @@ def dockerfile_for_extension(
             "platform": "linux",
             "arch": "x64" if platform.machine().lower() in {"x86_64", "amd64"} else "arm64",
         })
-        setup_steps.append(f"RUN python setup.py {json.dumps(payload)}")
-    setup = "\n".join(setup_steps)
-    if setup:
-        setup += "\n"
-    return f"""FROM python:{python_version}-slim-bookworm
-ENV DEBIAN_FRONTEND=noninteractive PYTHONUTF8=1 PYTHONIOENCODING=utf-8 PIP_DISABLE_PIP_VERSION_CHECK=1
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake git libgl1 libglib2.0-0 libgomp1 ninja-build nodejs npm && rm -rf /var/lib/apt/lists/*
-WORKDIR /opt/modly/extension
-COPY . .
-{accelerator_environment}{setup}RUN set -eux; python_path=/usr/local/bin/python; if [ -x venv/bin/python ]; then python_path=/opt/modly/extension/venv/bin/python; elif [ -x .venv/bin/python ]; then python_path=/opt/modly/extension/.venv/bin/python; fi; ln -sf "$python_path" /opt/modly/runtime-python
-CMD ["/opt/modly/runtime-python", "/modly/api/runner.py"]
-"""
+        steps.append(f"python setup.py {shlex.quote(payload)}")
+    steps.extend([
+        "python_path=/usr/local/bin/python",
+        "if [ -x venv/bin/python ]; then python_path=/opt/modly/extension/venv/bin/python; "
+        "elif [ -x .venv/bin/python ]; then python_path=/opt/modly/extension/.venv/bin/python; fi",
+        'ln -sf "$python_path" /opt/modly/runtime-python',
+    ])
+    return "; ".join(steps)
+
+
+def docker_gpu_arguments(nvidia_mode: str) -> list[str]:
+    if nvidia_mode == "runtime":
+        return ["--gpus", "all"]
+    if nvidia_mode == "cdi":
+        return ["--device", "nvidia.com/gpu=all"]
+    return []
 
 
 def docker_run_prefix(
@@ -372,10 +405,7 @@ def docker_run_prefix(
             command += ["--user", f"{os.getuid()}:{os.getgid()}"]
     else:
         command += ["--add-host", "host.docker.internal:host-gateway"]
-    if nvidia_mode == "runtime":
-        command += ["--gpus", "all"]
-    elif nvidia_mode == "cdi":
-        command += ["--device", "nvidia.com/gpu=all"]
+    command += docker_gpu_arguments(nvidia_mode)
     runtime_environment: dict[str, str | None] = {
         "HOME": "/tmp",
         "XDG_CACHE_HOME": "/modly/cache",
