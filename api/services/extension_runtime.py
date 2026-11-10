@@ -104,13 +104,40 @@ def docker_capabilities(root: Path) -> dict:
         if not available:
             reason = "Docker is installed, but its daemon is not available to the Modly server."
 
-    toolkit = False
+    toolkit_installed = False
+    container_mode = ""
     if available:
         ok, runtimes = _run_probe([docker, "info", "--format", "{{json .Runtimes}}"])
-        # `--gpus all` requires Docker's NVIDIA runtime to be configured. The
-        # CLI package existing on disk is not enough to make GPU passthrough
-        # usable by a container.
-        toolkit = ok and "nvidia" in runtimes.lower()
+        # Legacy NVIDIA Container Runtime configuration. This is the path used
+        # by `docker run --gpus all` and remains the most widely deployed mode.
+        if ok and "nvidia" in runtimes.lower():
+            toolkit_installed = True
+            container_mode = "runtime"
+
+        nvidia_ctk = shutil.which("nvidia-ctk")
+        nvidia_container_cli = shutil.which("nvidia-container-cli")
+        for executable in (nvidia_ctk, nvidia_container_cli):
+            if executable:
+                probe_ok, _ = _run_probe([executable, "--version"])
+                toolkit_installed = toolkit_installed or probe_ok
+
+        # Docker Engine can also consume NVIDIA's generated CDI specification
+        # without exposing a runtime literally named `nvidia`. Verify both the
+        # daemon-side CDI facility and an actual all-GPU NVIDIA CDI device; a
+        # binary on PATH alone does not prove Docker can inject the GPU.
+        if not container_mode and nvidia_ctk:
+            docker_cdi_ok, cdi_directories = _run_probe(
+                [docker, "info", "--format", "{{json .CDISpecDirs}}"]
+            )
+            cdi_ok, cdi_devices = _run_probe([nvidia_ctk, "cdi", "list"])
+            if (
+                docker_cdi_ok
+                and cdi_directories.strip() not in {"", "null", "[]"}
+                and cdi_ok
+                and "nvidia.com/gpu=all" in cdi_devices.lower()
+            ):
+                toolkit_installed = True
+                container_mode = "cdi"
 
     selected = runtime_settings(root)["useDocker"]
     return {
@@ -118,7 +145,9 @@ def docker_capabilities(root: Path) -> dict:
         "configuredUseDocker": selected,
         "dockerAvailable": available,
         "dockerVersion": version if available else "",
-        "nvidiaToolkitAvailable": toolkit,
+        "nvidiaToolkitInstalled": toolkit_installed,
+        "nvidiaToolkitAvailable": bool(container_mode),
+        "nvidiaContainerMode": container_mode,
         "reason": "" if available else reason,
         "serverPlatform": platform.system().lower(),
     }
@@ -320,7 +349,7 @@ def docker_run_prefix(
     workspace_dir: Path,
     api_dir: Path,
     cache_dir: Path,
-    nvidia: bool,
+    nvidia_mode: str = "",
     environment: dict[str, str | None] | None = None,
 ) -> list[str]:
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -343,8 +372,10 @@ def docker_run_prefix(
             command += ["--user", f"{os.getuid()}:{os.getgid()}"]
     else:
         command += ["--add-host", "host.docker.internal:host-gateway"]
-    if nvidia:
+    if nvidia_mode == "runtime":
         command += ["--gpus", "all"]
+    elif nvidia_mode == "cdi":
+        command += ["--device", "nvidia.com/gpu=all"]
     runtime_environment: dict[str, str | None] = {
         "HOME": "/tmp",
         "XDG_CACHE_HOME": "/modly/cache",

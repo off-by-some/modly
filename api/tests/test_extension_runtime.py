@@ -102,12 +102,28 @@ class ExtensionRuntimeTests(unittest.TestCase):
             workspace_dir=Path("/tmp/workspace"),
             api_dir=Path("/tmp/api"),
             cache_dir=Path("/tmp"),
-            nvidia=True,
+            nvidia_mode="runtime",
             environment={"MODLY_SERVER_TOKEN": None},
         )
         self.assertIn("MODLY_SERVER_TOKEN", command)
         self.assertFalse(any(item.startswith("MODLY_SERVER_TOKEN=") for item in command))
         self.assertIn("host", command)
+        self.assertIn("--gpus", command)
+
+    @patch("services.extension_runtime.platform.system", return_value="Linux")
+    @patch("services.extension_runtime.shutil.which", return_value="/usr/bin/docker")
+    def test_docker_command_uses_cdi_device_when_selected(self, _which, _system):
+        command = docker_run_prefix(
+            "modly-extension-example:0123456789abcdef",
+            name="modly-test",
+            models_dir=Path("/tmp/models"),
+            workspace_dir=Path("/tmp/workspace"),
+            api_dir=Path("/tmp/api"),
+            cache_dir=Path("/tmp"),
+            nvidia_mode="cdi",
+        )
+        self.assertIn("--device", command)
+        self.assertIn("nvidia.com/gpu=all", command)
 
     @patch("services.extension_runtime.shutil.which")
     @patch("services.extension_runtime._run_probe")
@@ -118,6 +134,78 @@ class ExtensionRuntimeTests(unittest.TestCase):
             status = docker_capabilities(Path(temporary))
             self.assertFalse(status["dockerAvailable"])
             self.assertIn("daemon", status["reason"])
+
+    @patch("services.extension_runtime.shutil.which")
+    @patch("services.extension_runtime._run_probe")
+    def test_docker_capability_accepts_registered_nvidia_runtime(self, run_probe, which):
+        with tempfile.TemporaryDirectory() as temporary:
+            which.side_effect = lambda name: f"/usr/bin/{name}" if name in {
+                "docker", "nvidia-ctk", "nvidia-container-cli"
+            } else None
+
+            def probe(command, timeout=5):
+                del timeout
+                if command[1:3] == ["version", "--format"]:
+                    return True, "28.4.0"
+                if command[-1] == "{{json .Runtimes}}":
+                    return True, '{"runc":{},"nvidia":{}}'
+                return True, "1.18.0"
+
+            run_probe.side_effect = probe
+            status = docker_capabilities(Path(temporary))
+            self.assertTrue(status["nvidiaToolkitInstalled"])
+            self.assertTrue(status["nvidiaToolkitAvailable"])
+            self.assertEqual(status["nvidiaContainerMode"], "runtime")
+
+    @patch("services.extension_runtime.shutil.which")
+    @patch("services.extension_runtime._run_probe")
+    def test_docker_capability_accepts_native_nvidia_cdi(self, run_probe, which):
+        with tempfile.TemporaryDirectory() as temporary:
+            which.side_effect = lambda name: f"/usr/bin/{name}" if name in {
+                "docker", "nvidia-ctk"
+            } else None
+
+            def probe(command, timeout=5):
+                del timeout
+                if command[1:3] == ["version", "--format"]:
+                    return True, "28.4.0"
+                if command[-1] == "{{json .Runtimes}}":
+                    return True, '{"runc":{}}'
+                if command[-1] == "{{json .CDISpecDirs}}":
+                    return True, '["/etc/cdi","/var/run/cdi"]'
+                if command[-2:] == ["cdi", "list"]:
+                    return True, "nvidia.com/gpu=all\nnvidia.com/gpu=0"
+                return True, "1.18.0"
+
+            run_probe.side_effect = probe
+            status = docker_capabilities(Path(temporary))
+            self.assertTrue(status["nvidiaToolkitInstalled"])
+            self.assertTrue(status["nvidiaToolkitAvailable"])
+            self.assertEqual(status["nvidiaContainerMode"], "cdi")
+
+    @patch("services.extension_runtime.shutil.which")
+    @patch("services.extension_runtime._run_probe")
+    def test_docker_capability_distinguishes_installed_from_configured(self, run_probe, which):
+        with tempfile.TemporaryDirectory() as temporary:
+            which.side_effect = lambda name: f"/usr/bin/{name}" if name in {
+                "docker", "nvidia-ctk"
+            } else None
+
+            def probe(command, timeout=5):
+                del timeout
+                if command[1:3] == ["version", "--format"]:
+                    return True, "27.5.1"
+                if command[-1] == "{{json .Runtimes}}":
+                    return True, '{"runc":{}}'
+                if command[-1] == "{{json .CDISpecDirs}}":
+                    return False, "template: no field CDISpecDirs"
+                return True, "1.18.0"
+
+            run_probe.side_effect = probe
+            status = docker_capabilities(Path(temporary))
+            self.assertTrue(status["nvidiaToolkitInstalled"])
+            self.assertFalse(status["nvidiaToolkitAvailable"])
+            self.assertEqual(status["nvidiaContainerMode"], "")
 
 
 if __name__ == "__main__":

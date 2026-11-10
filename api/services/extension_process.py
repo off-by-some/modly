@@ -578,7 +578,11 @@ class DockerExtensionProcess(ExtensionProcess):
             workspace_dir=WORKSPACE_DIR,
             api_dir=Path(__file__).parent.parent,
             cache_dir=MODELS_DIR / ".modly-runtime-cache" / self.ext_dir.name,
-            nvidia=bool(self.runtime.get("nvidia") and capabilities["nvidiaToolkitAvailable"]),
+            nvidia_mode=(
+                str(capabilities.get("nvidiaContainerMode", ""))
+                if self.runtime.get("nvidia") and capabilities["nvidiaToolkitAvailable"]
+                else ""
+            ),
             environment=container_env,
         )
         return command, os.environ.copy(), None

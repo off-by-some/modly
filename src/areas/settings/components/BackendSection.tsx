@@ -213,7 +213,7 @@ export function BackendSection(): JSX.Element {
         <Row
           label="Use Docker"
           description={runtime?.dockerAvailable
-            ? `Build and run URL-installed extensions in isolated containers${runtime.dockerVersion ? ` (Docker ${runtime.dockerVersion})` : ''}. Switching modes hides extensions installed for the other runtime.`
+            ? `Build and run URL-installed extensions in isolated containers${runtime.dockerVersion ? ` (Docker ${runtime.dockerVersion})` : ''}${runtime.nvidiaToolkitAvailable ? ` with NVIDIA GPU access via ${runtime.nvidiaContainerMode === 'cdi' ? 'CDI' : 'the NVIDIA runtime'}` : ''}. Switching modes hides extensions installed for the other runtime.`
             : runtimeLoading
               ? 'Checking Docker on the selected server…'
               : runtime?.reason || runtimeError || 'Docker is not available on the selected server.'}
@@ -226,13 +226,15 @@ export function BackendSection(): JSX.Element {
         </Row>
         {runtime?.dockerAvailable && !runtime.nvidiaToolkitAvailable && (
           <div className="mx-4 my-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[11px] text-amber-200">
-            No NVIDIA Container Toolkit was detected. Docker extensions will not use an NVIDIA GPU even if one is available.{' '}
+            {runtime.nvidiaToolkitInstalled
+              ? 'NVIDIA Container Toolkit is installed, but this Docker daemon has no configured NVIDIA runtime or usable CDI device. Docker extensions will not use an NVIDIA GPU until Docker is configured.'
+              : 'No NVIDIA Container Toolkit was detected. Docker extensions will not use an NVIDIA GPU even if one is available.'}{' '}
             <button
               type="button"
               className="underline underline-offset-2 hover:text-amber-100"
               onClick={() => void window.electron.shell.openExternal('https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html')}
             >
-              Install NVIDIA Container Toolkit
+              {runtime.nvidiaToolkitInstalled ? 'Configure Docker GPU support' : 'Install NVIDIA Container Toolkit'}
             </button>
           </div>
         )}

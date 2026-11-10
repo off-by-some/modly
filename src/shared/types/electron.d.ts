@@ -109,7 +109,9 @@ export interface ExtensionRuntimeStatus {
   configuredUseDocker: boolean
   dockerAvailable: boolean
   dockerVersion: string
+  nvidiaToolkitInstalled: boolean
   nvidiaToolkitAvailable: boolean
+  nvidiaContainerMode: 'runtime' | 'cdi' | ''
   reason: string
   serverPlatform: string
 }

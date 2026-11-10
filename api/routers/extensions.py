@@ -492,7 +492,11 @@ async def run_process(body: ProcessRun):
             workspace_dir=workspace,
             api_dir=Path(__file__).resolve().parents[1],
             cache_dir=registry.MODELS_DIR / ".modly-runtime-cache" / body.extension_id,
-            nvidia=bool(runtime.get("nvidia") and capabilities["nvidiaToolkitAvailable"]),
+            nvidia_mode=(
+                str(capabilities.get("nvidiaContainerMode", ""))
+                if runtime.get("nvidia") and capabilities["nvidiaToolkitAvailable"]
+                else ""
+            ),
             environment={
                 "EXTENSION_DIR": "/opt/modly/extension",
                 "WORKSPACE_DIR": "/modly/workspace",

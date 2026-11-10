@@ -257,7 +257,9 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         configuredUseDocker: boolean
         dockerAvailable: boolean
         dockerVersion: string
+        nvidiaToolkitInstalled: boolean
         nvidiaToolkitAvailable: boolean
+        nvidiaContainerMode: 'runtime' | 'cdi' | ''
         reason: string
         serverPlatform: string
       }> => ipcRenderer.invoke('extensions:runtimeStatus') as Promise<{
@@ -265,7 +267,9 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         configuredUseDocker: boolean
         dockerAvailable: boolean
         dockerVersion: string
+        nvidiaToolkitInstalled: boolean
         nvidiaToolkitAvailable: boolean
+        nvidiaContainerMode: 'runtime' | 'cdi' | ''
         reason: string
         serverPlatform: string
       }>,
@@ -275,7 +279,9 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         configuredUseDocker: boolean
         dockerAvailable: boolean
         dockerVersion: string
+        nvidiaToolkitInstalled: boolean
         nvidiaToolkitAvailable: boolean
+        nvidiaContainerMode: 'runtime' | 'cdi' | ''
         reason: string
         serverPlatform: string
       }> => ipcRenderer.invoke('extensions:setDockerEnabled', useDocker) as Promise<{
@@ -283,7 +289,9 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
         configuredUseDocker: boolean
         dockerAvailable: boolean
         dockerVersion: string
+        nvidiaToolkitInstalled: boolean
         nvidiaToolkitAvailable: boolean
+        nvidiaContainerMode: 'runtime' | 'cdi' | ''
         reason: string
         serverPlatform: string
       }>,
