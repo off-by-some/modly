@@ -13,8 +13,11 @@ from unittest.mock import patch
 import services.generator_registry as registry_module
 from routers.extensions import (
     GitHubInstall,
+    LocalInstall,
+    _manifest_for_client,
     _install_jobs,
     install_from_github,
+    install_local,
     install_github_status,
     reload_extensions,
 )
@@ -83,6 +86,38 @@ class ExtensionReloadRouteTests(unittest.TestCase):
         self.assertEqual(self.registry.reload_calls, [capability])
 
 
+class ExtensionManifestProjectionTests(unittest.TestCase):
+    def test_server_projection_preserves_desktop_manifest_semantics(self) -> None:
+        projected = _manifest_for_client(
+            {
+                "id": "example",
+                "displayName": "Example Extension",
+                "author": {"name": "Example Author"},
+                "source": "https://github.com/acme/example/",
+                "params_schema": [{"id": "quality", "type": "number"}],
+                "param_defaults": {"quality": 2, "shared": "top"},
+                "nodes": [{
+                    "id": "generate",
+                    "param_defaults": {"shared": "node"},
+                }],
+            },
+            runtime="system",
+            trusted_repos={"https://github.com/acme/example"},
+        )
+
+        self.assertEqual(projected["name"], "Example Extension")
+        self.assertEqual(projected["author"], "Example Author")
+        self.assertTrue(projected["trusted"])
+        self.assertEqual(
+            projected["nodes"][0]["paramsSchema"],
+            [{"id": "quality", "type": "number"}],
+        )
+        self.assertEqual(
+            projected["nodes"][0]["paramDefaults"],
+            {"quality": 2, "shared": "node"},
+        )
+
+
 class ExtensionInstallStatusTests(unittest.TestCase):
     def test_install_continues_after_the_progress_stream_disconnects(self) -> None:
         async def fake_install(_url: str, _root: Path, progress) -> dict:
@@ -140,6 +175,39 @@ class ExtensionInstallStatusTests(unittest.TestCase):
 
         self.assertTrue(status["done"])
         self.assertEqual(status["terminal"], terminal)
+
+
+class LocalExtensionInstallTests(unittest.TestCase):
+    def test_bundled_local_install_is_linked_and_registered_by_server(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "extensions"
+            source = base / "checkout"
+            root.mkdir()
+            source.mkdir()
+            (source / "manifest.json").write_text(json.dumps({
+                "id": "local-example",
+                "type": "process",
+                "entry": "processor.py",
+                "nodes": [{"id": "run"}],
+            }), encoding="utf-8")
+            (source / "processor.py").write_text("pass\n", encoding="utf-8")
+
+            previous_root = registry_module.EXTENSIONS_DIR
+            previous_registry = registry_module.generator_registry
+            registry_module.EXTENSIONS_DIR = root
+            registry_module.generator_registry = _FakeRegistry()
+            try:
+                with patch.dict(os.environ, {"MODLY_DESKTOP_MANAGED": "1"}):
+                    result = asyncio.run(install_local(LocalInstall(path=str(source))))
+            finally:
+                registry_module.generator_registry = previous_registry
+                registry_module.EXTENSIONS_DIR = previous_root
+
+            self.assertTrue(result["success"])
+            self.assertTrue((root / "local-example").is_symlink())
+            runtime = json.loads((source / ".modly-runtime.json").read_text(encoding="utf-8"))
+            self.assertEqual(runtime["localSource"], str(source.resolve()))
 
 
 class ServerExtensionInstallerTests(unittest.TestCase):

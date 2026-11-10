@@ -20,8 +20,14 @@ class _FakeUpload:
         self.content_type = content_type
         self._data = data
 
-    async def read(self) -> bytes:
-        return self._data
+    async def read(self, size: int = -1) -> bytes:
+        if not self._data:
+            return b""
+        if size < 0:
+            data, self._data = self._data, b""
+            return data
+        data, self._data = self._data[:size], self._data[size:]
+        return data
 
 
 class _FakeRegistry:

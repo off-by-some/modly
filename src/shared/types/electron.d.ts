@@ -49,6 +49,7 @@ export interface ModelExtension {
   author?:      string
   trusted:      boolean
   builtin:      boolean
+  runtime?:     'builtin' | 'system' | 'docker'
   source?:      string
   localPath?:   string
   nodes:        ExtensionNode[]
@@ -90,6 +91,7 @@ export interface ProcessExtension {
   author?:      string
   trusted:      boolean
   builtin:      boolean
+  runtime?:     'builtin' | 'system' | 'docker'
   source?:      string
   localPath?:   string
   entry:        string
@@ -101,6 +103,16 @@ export interface ProcessExtension {
 }
 
 export type AnyExtension = ModelExtension | ProcessExtension
+
+export interface ExtensionRuntimeStatus {
+  useDocker: boolean
+  configuredUseDocker: boolean
+  dockerAvailable: boolean
+  dockerVersion: string
+  nvidiaToolkitAvailable: boolean
+  reason: string
+  serverPlatform: string
+}
 
 // ─── Process runner types ─────────────────────────────────────────────────────
 
@@ -344,6 +356,8 @@ declare global {
         offMajorMinorAvailable: () => void
       }
       extensions: {
+        runtimeStatus:     () => Promise<ExtensionRuntimeStatus>
+        setDockerEnabled:  (useDocker: boolean) => Promise<ExtensionRuntimeStatus>
         list:              () => Promise<AnyExtension[]>
         installFromGitHub: (url: string) => Promise<{
           success:      boolean

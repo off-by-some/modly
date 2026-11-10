@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useAppStore } from '@shared/stores/appStore'
-import { Card, Section, SegmentedControl } from '@shared/ui'
+import { Card, Row, Section, SegmentedControl, Toggle } from '@shared/ui'
 import type { BackendMode } from '@shared/utils/backendServer'
+import type { ExtensionRuntimeStatus } from '@shared/types/electron.d'
 import { useExtensionsStore } from '@shared/stores/extensionsStore'
 import { useWorkflowsStore } from '@shared/stores/workflowsStore'
 import { useLlmModelsStore } from '@shared/stores/llmModelsStore'
@@ -23,6 +24,25 @@ export function BackendSection(): JSX.Element {
   const [allowInsecure, setAllowInsecure] = useState(allowInsecureRemote)
   const [saveState, setSaveState] = useState<SaveState>('idle')
   const [message, setMessage] = useState('')
+  const [runtime, setRuntime] = useState<ExtensionRuntimeStatus | null>(null)
+  const [runtimeLoading, setRuntimeLoading] = useState(true)
+  const [runtimeError, setRuntimeError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    setRuntimeLoading(true)
+    setRuntimeError('')
+    window.electron.extensions.runtimeStatus()
+      .then((status) => { if (!cancelled) setRuntime(status) })
+      .catch((error) => {
+        if (!cancelled) {
+          setRuntime(null)
+          setRuntimeError(error instanceof Error ? error.message : 'Could not inspect Docker on this server.')
+        }
+      })
+      .finally(() => { if (!cancelled) setRuntimeLoading(false) })
+    return () => { cancelled = true }
+  }, [apiUrl, backendMode])
 
   useEffect(() => {
     setMode(backendMode)
@@ -64,9 +84,24 @@ export function BackendSection(): JSX.Element {
     setMessage('')
   }
 
+  async function changeDockerMode(enabled: boolean): Promise<void> {
+    setRuntimeLoading(true)
+    setRuntimeError('')
+    try {
+      const status = await window.electron.extensions.setDockerEnabled(enabled)
+      setRuntime(status)
+      await useExtensionsStore.getState().loadExtensions()
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : 'Could not update the extension runtime.')
+    } finally {
+      setRuntimeLoading(false)
+    }
+  }
+
   return (
     <Section title="Backend" subtitle="Choose the Modly API server used for generation, workflows, and models.">
-      <Card
+      <div className="space-y-4">
+        <Card
         title="API server"
         description="The bundled server remains available so you can switch back at any time."
         aside={(
@@ -170,7 +205,42 @@ export function BackendSection(): JSX.Element {
             {saveState === 'saving' ? 'Connecting…' : mode === 'remote' ? 'Test & connect' : 'Use bundled server'}
           </button>
         </div>
-      </Card>
+        </Card>
+        <Card
+        title="Extension runtime"
+        description="Choose how extensions installed from a GitHub URL run on the selected server."
+      >
+        <Row
+          label="Use Docker"
+          description={runtime?.dockerAvailable
+            ? `Build and run URL-installed extensions in isolated containers${runtime.dockerVersion ? ` (Docker ${runtime.dockerVersion})` : ''}. Switching modes hides extensions installed for the other runtime.`
+            : runtimeLoading
+              ? 'Checking Docker on the selected server…'
+              : runtime?.reason || runtimeError || 'Docker is not available on the selected server.'}
+        >
+          <Toggle
+            value={runtime?.configuredUseDocker ?? false}
+            disabled={runtimeLoading || (!runtime?.dockerAvailable && !runtime?.configuredUseDocker)}
+            onChange={(enabled) => void changeDockerMode(enabled)}
+          />
+        </Row>
+        {runtime?.dockerAvailable && !runtime.nvidiaToolkitAvailable && (
+          <div className="mx-4 my-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[11px] text-amber-200">
+            No NVIDIA Container Toolkit was detected. Docker extensions will not use an NVIDIA GPU even if one is available.{' '}
+            <button
+              type="button"
+              className="underline underline-offset-2 hover:text-amber-100"
+              onClick={() => void window.electron.shell.openExternal('https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html')}
+            >
+              Install NVIDIA Container Toolkit
+            </button>
+          </div>
+        )}
+        {runtimeError && runtime?.dockerAvailable && (
+          <p className="px-4 py-3 text-[11px] text-red-400">{runtimeError}</p>
+        )}
+        </Card>
+      </div>
     </Section>
   )
 }

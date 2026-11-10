@@ -327,6 +327,7 @@ export const useAppStore = create<AppState>()(
       setMeshSelected: (selected) => set({ meshSelected: selected }),
       initApp: async () => {
         set({ backendStatus: 'starting', backendError: null })
+        let remoteFallbackMessage = ''
 
         window.electron.python.offCrashed()
         window.electron.python.onCrashed(({ code }) => {
@@ -345,12 +346,28 @@ export const useAppStore = create<AppState>()(
                 ? (await window.electron.secureStore.decrypt(remoteApiTokenEncrypted) ?? '')
                 : ''
               assertBackendTransportAllowed(apiUrl, allowInsecureRemote, Boolean(apiToken))
+              // Do not mount the application against a dead persisted endpoint.
+              // Catalog and workspace stores load as soon as backendStatus becomes
+              // ready, so accepting an unchecked server makes a healthy local
+              // installation look completely empty until the background outage
+              // monitor eventually falls back.
+              await checkBackendServer(apiUrl, apiToken, allowInsecureRemote)
               await window.electron.backend.select(apiUrl, apiToken)
-              set({ backendStatus: 'ready', remoteBackendStatus: 'unknown', apiUrl, apiToken })
+              set({ backendStatus: 'ready', remoteBackendStatus: 'online', apiUrl, apiToken })
               return
-            } catch {
-              // A malformed persisted value should never prevent access to Settings.
-              set({ backendMode: 'local', remoteApiUrl: '' })
+            } catch (error) {
+              // Preserve the configured URL so it can be retried from Settings,
+              // but make local mode authoritative before starting its server.
+              // backend.select(local) below also persists the selected endpoint,
+              // preventing the next launch from repeating the failed remote boot.
+              remoteFallbackMessage = error instanceof Error
+                ? `The custom server was unavailable at startup (${error.message}). Modly switched to the local server.`
+                : 'The custom server was unavailable at startup. Modly switched to the local server.'
+              set({
+                backendMode: 'local',
+                apiToken: '',
+                remoteBackendStatus: 'offline',
+              })
             }
           }
 
@@ -359,6 +376,10 @@ export const useAppStore = create<AppState>()(
           const { apiUrl } = await window.electron.app.info()
           await window.electron.backend.select(apiUrl)
           set({ backendStatus: 'ready', apiUrl })
+          if (remoteFallbackMessage) {
+            get().showToast(remoteFallbackMessage, 7000)
+            void window.electron.notifications.show('Modly server changed', remoteFallbackMessage)
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
           set({ backendStatus: 'error', backendError: msg })

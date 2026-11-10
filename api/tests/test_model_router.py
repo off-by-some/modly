@@ -252,6 +252,13 @@ class MultiSourceRouterTests(unittest.TestCase):
         self.assertEqual(result["progress"]["percent"], 100)
         self.assertEqual(result["progress"]["logs"][-1], "Download complete")
 
+    def test_server_rejects_weight_deletion_during_managed_download(self) -> None:
+        model_router._managed_download_controls["pixal3d/generate"] = {}
+        with self.assertRaisesRegex(Exception, "download is active"):
+            asyncio.run(model_router.delete_model_storage("pixal3d/generate"))
+        with self.assertRaisesRegex(Exception, "download is active"):
+            asyncio.run(model_router.delete_extension_storage("pixal3d"))
+
     def test_rejects_a_check_filtered_out_of_the_source_plan(self) -> None:
         calls: list[str] = []
         self.install_hf_stub({"org/main": ["other.bin"]}, calls)

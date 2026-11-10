@@ -252,6 +252,42 @@ export function createElectronApi(ipcRenderer: IpcRendererLike, webFrame: WebFra
 
     // Extensions
     extensions: {
+      runtimeStatus: (): Promise<{
+        useDocker: boolean
+        configuredUseDocker: boolean
+        dockerAvailable: boolean
+        dockerVersion: string
+        nvidiaToolkitAvailable: boolean
+        reason: string
+        serverPlatform: string
+      }> => ipcRenderer.invoke('extensions:runtimeStatus') as Promise<{
+        useDocker: boolean
+        configuredUseDocker: boolean
+        dockerAvailable: boolean
+        dockerVersion: string
+        nvidiaToolkitAvailable: boolean
+        reason: string
+        serverPlatform: string
+      }>,
+
+      setDockerEnabled: (useDocker: boolean): Promise<{
+        useDocker: boolean
+        configuredUseDocker: boolean
+        dockerAvailable: boolean
+        dockerVersion: string
+        nvidiaToolkitAvailable: boolean
+        reason: string
+        serverPlatform: string
+      }> => ipcRenderer.invoke('extensions:setDockerEnabled', useDocker) as Promise<{
+        useDocker: boolean
+        configuredUseDocker: boolean
+        dockerAvailable: boolean
+        dockerVersion: string
+        nvidiaToolkitAvailable: boolean
+        reason: string
+        serverPlatform: string
+      }>,
+
       list: (): Promise<unknown[]> =>
         ipcRenderer.invoke('extensions:list') as Promise<unknown[]>,
 

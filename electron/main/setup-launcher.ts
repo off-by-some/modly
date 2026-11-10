@@ -42,7 +42,11 @@ def _mentions_torch(command):
     return any(_is_torch_requirement(str(part)) for part in command)
 
 def _rewrite_command(command):
-    if sys.platform != "darwin" or not _mentions_torch(command):
+    if (
+        sys.platform != "darwin"
+        or os.environ.get("MODLY_TORCH_FLAVOR") == "cuda"
+        or not _mentions_torch(command)
+    ):
         return command
     if not isinstance(command, (list, tuple)):
         return command

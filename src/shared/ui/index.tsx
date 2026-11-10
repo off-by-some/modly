@@ -90,11 +90,15 @@ export function InfoRow({ label, value }: { label: string; value: string }): JSX
   )
 }
 
-export function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }): JSX.Element {
+export function Toggle({ value, onChange, disabled = false }: { value: boolean; onChange: (v: boolean) => void; disabled?: boolean }): JSX.Element {
   return (
     <button
+      type="button"
+      role="switch"
+      aria-checked={value}
+      disabled={disabled}
       onClick={() => onChange(!value)}
-      className={`relative w-9 h-5 rounded-full transition-colors duration-200 shrink-0 ${value ? 'bg-accent' : 'bg-zinc-700'}`}
+      className={`relative w-9 h-5 rounded-full transition-colors duration-200 shrink-0 disabled:opacity-40 disabled:cursor-not-allowed ${value ? 'bg-accent' : 'bg-zinc-700'}`}
     >
       <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${value ? 'translate-x-4' : 'translate-x-0'}`} />
     </button>

@@ -21,6 +21,18 @@ from urllib.parse import urlparse
 import httpx
 
 from services.builtin_extensions import BUILTIN_MARKER
+from services.extension_runtime import (
+    RUNTIME_MARKER,
+    docker_capabilities,
+    docker_image_name,
+    dockerfile_for_extension,
+    extension_runtime,
+    infer_python_version,
+    recommended_cuda_lane,
+    remove_extension_image,
+    runtime_settings,
+    write_extension_runtime,
+)
 from services.upload_limits import optional_env_limit
 
 
@@ -42,6 +54,14 @@ class InstallCommandError(RuntimeError):
     def __init__(self, summary: str, details: str):
         super().__init__(summary)
         self.details = details
+
+
+def _remove_path(path: Path) -> None:
+    """Remove an extension transaction path without following symlinks."""
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def extension_setup_environment(
@@ -344,10 +364,87 @@ async def _setup_extension(extension_dir: Path, manifest: dict, entry: str, prog
         )
 
 
+async def _setup_docker_extension(
+    root: Path,
+    extension_dir: Path,
+    manifest: dict,
+    entry: str,
+    progress: Progress,
+) -> dict:
+    capabilities = await asyncio.to_thread(docker_capabilities, root)
+    if not capabilities["dockerAvailable"]:
+        raise RuntimeError(capabilities["reason"] or "Docker is not available on this server")
+
+    typescript_entry = entry if entry.endswith(".ts") else ""
+
+    from routers.extensions import _detect_nvidia_gpu
+    gpu_sm, detected_cuda = _detect_nvidia_gpu()
+    cuda_version = recommended_cuda_lane(gpu_sm, detected_cuda)
+    python_version = infer_python_version(extension_dir, manifest)
+    image = docker_image_name(extension_dir, manifest)
+    dockerfile = dockerfile_for_extension(
+        extension_dir,
+        manifest,
+        python_version,
+        gpu_sm,
+        cuda_version,
+        typescript_entry,
+    )
+    # Build from a server-created context. A repository-controlled
+    # .dockerignore must not be able to silently omit its manifest, entrypoint,
+    # or setup files, and old host venvs must never be copied into an image.
+    with tempfile.TemporaryDirectory(prefix="modly-extension-build-") as temporary:
+        build_context = Path(temporary) / "context"
+        await asyncio.to_thread(
+            shutil.copytree,
+            extension_dir,
+            build_context,
+            symlinks=False,
+            ignore=shutil.ignore_patterns(
+                ".git", ".dockerignore", "venv", ".venv", "node_modules",
+                "__pycache__", "*.pyc", INCOMPLETE_MARKER, RUNTIME_MARKER,
+            ),
+        )
+        dockerfile_path = build_context / ".modly.Dockerfile"
+        dockerfile_path.write_text(dockerfile, encoding="utf-8")
+        await _run_command(
+            [
+                shutil.which("docker") or "docker",
+                "build",
+                "--progress",
+                "plain",
+                "--tag",
+                image,
+                "--file",
+                str(dockerfile_path),
+                ".",
+            ],
+            build_context,
+            progress,
+            f"Building Docker runtime (Python {python_version})",
+        )
+
+    metadata = {
+        "kind": "docker",
+        "image": image,
+        "python": python_version,
+        "cudaVersion": cuda_version,
+        "gpuSm": gpu_sm,
+        # The image is CUDA-capable based on the server GPU lane. Toolkit
+        # availability is evaluated at invocation time so installing or fixing
+        # the toolkit later immediately enables GPU passthrough.
+        "nvidia": bool(gpu_sm),
+        **({"entry": str(Path(typescript_entry).with_suffix(".js"))}
+           if typescript_entry else {}),
+    }
+    write_extension_runtime(extension_dir, metadata)
+    return metadata
+
+
 def recover_interrupted_installs(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     for staging in root.glob(".modly-install-*"):
-        shutil.rmtree(staging, ignore_errors=True)
+        _remove_path(staging)
     pending_ids = {
         remainder.rsplit("-", 1)[0]
         for state in root.glob(f"{REGISTRATION_PENDING_PREFIX}*")
@@ -367,18 +464,23 @@ def recover_interrupted_installs(root: Path) -> None:
             continue
         destination = root / extension_id
         if extension_id in pending_ids or not destination.exists() or (destination / INCOMPLETE_MARKER).exists():
-            shutil.rmtree(destination, ignore_errors=True)
+            if destination.exists() or destination.is_symlink():
+                remove_extension_image(extension_runtime(destination))
+            _remove_path(destination)
             backup.rename(destination)
             for state in _registration_state_paths(root, extension_id):
                 state.unlink(missing_ok=True)
             pending_ids.discard(extension_id)
         else:
-            shutil.rmtree(backup, ignore_errors=True)
+            _remove_path(backup)
     # A fresh install has no backup. Pending registration still means its
     # runtime was never committed, so discard it instead of exposing an
     # unvalidated extension after restart.
     for extension_id in pending_ids:
-        shutil.rmtree(root / extension_id, ignore_errors=True)
+        destination = root / extension_id
+        if destination.exists() or destination.is_symlink():
+            remove_extension_image(extension_runtime(destination))
+        _remove_path(root / extension_id)
         for state in _registration_state_paths(root, extension_id):
             state.unlink(missing_ok=True)
 
@@ -395,6 +497,8 @@ async def install_github(url: str, root: Path, progress: Progress) -> dict:
         backup: Path | None = None
         registration_state: Path | None = None
         activated = False
+        previous_runtime: dict = {}
+        installed_runtime: dict = {}
         try:
             await _download_archive(f"https://api.github.com/repos/{owner}/{repo}/tarball/HEAD", archive_path, progress)
             await progress({"step": "extracting"})
@@ -405,7 +509,8 @@ async def install_github(url: str, root: Path, progress: Progress) -> dict:
             destination = root / extension_id
             if (destination / BUILTIN_MARKER).is_file():
                 raise ValueError("Built-in extensions are managed by the server and cannot be replaced")
-            if destination.exists():
+            if destination.exists() or destination.is_symlink():
+                previous_runtime = extension_runtime(destination)
                 current, _, _, _ = validate_manifest(destination)
                 if current["id"] != extension_id or (current.get("type") == "process") != (manifest.get("type") == "process"):
                     raise ValueError("The existing extension cannot be safely replaced; uninstall it first")
@@ -414,11 +519,18 @@ async def install_github(url: str, root: Path, progress: Progress) -> dict:
             (extracted / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
             (extracted / INCOMPLETE_MARKER).write_text("installing\n", encoding="utf-8")
             backup = root / f".modly-backup-{extension_id}-{uuid.uuid4().hex}"
-            if destination.exists():
+            if destination.exists() or destination.is_symlink():
                 destination.rename(backup)
             extracted.rename(destination)
             activated = True
-            await _setup_extension(destination, manifest, entry, progress)
+            if runtime_settings(root)["useDocker"]:
+                installed_runtime = await _setup_docker_extension(
+                    root, destination, manifest, entry, progress
+                )
+            else:
+                installed_runtime = {"kind": "system"}
+                write_extension_runtime(destination, installed_runtime)
+                await _setup_extension(destination, manifest, entry, progress)
 
             from services.generator_registry import generator_registry
             validation_capability, registration_state = _begin_registration(root, extension_id)
@@ -430,14 +542,17 @@ async def install_github(url: str, root: Path, progress: Progress) -> dict:
                 raise RuntimeError("Extension runtime validation failed: " + "; ".join(relevant.values()))
             registration_state.unlink(missing_ok=True)
             registration_state = None
-            if backup.exists():
-                shutil.rmtree(backup, ignore_errors=True)
+            if backup.exists() or backup.is_symlink():
+                _remove_path(backup)
+            if previous_runtime.get("image") != installed_runtime.get("image"):
+                await asyncio.to_thread(remove_extension_image, previous_runtime)
             await progress({"step": "done", "extensionId": extension_id})
             return {"success": True, "extensionId": extension_id, "manifest": manifest}
         except Exception:
-            if activated and destination and destination.exists():
-                shutil.rmtree(destination, ignore_errors=True)
-            if destination and backup and backup.exists() and not destination.exists():
+            await asyncio.to_thread(remove_extension_image, installed_runtime)
+            if activated and destination and (destination.exists() or destination.is_symlink()):
+                _remove_path(destination)
+            if destination and backup and (backup.exists() or backup.is_symlink()) and not destination.exists() and not destination.is_symlink():
                 backup.rename(destination)
             if registration_state is not None:
                 registration_state.unlink(missing_ok=True)
@@ -449,4 +564,4 @@ async def install_github(url: str, root: Path, progress: Progress) -> dict:
                     pass
             raise
         finally:
-            shutil.rmtree(work, ignore_errors=True)
+            _remove_path(work)

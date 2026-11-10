@@ -111,12 +111,7 @@ class ExtensionProcess:
 
     def _start(self) -> None:
         """Launch the subprocess and wait for the 'ready' signal."""
-        python = _venv_python(self.ext_dir)
-        if not python.exists():
-            raise RuntimeError(
-                f"[{self.MODEL_ID}] venv not found at {python}. "
-                "Run the extension's setup.py first."
-            )
+        command, process_env, repair_python = self._launch_spec()
 
         for attempt in range(3):
             # Use a fresh queue per subprocess lifetime so late messages from an
@@ -124,7 +119,7 @@ class ExtensionProcess:
             run_queue: queue.Queue = queue.Queue()
             self._queue = run_queue
             self._proc = subprocess.Popen(
-                [str(python), str(_RUNNER_PATH)],
+                command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -138,7 +133,7 @@ class ExtensionProcess:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
-                env=self._build_env(),
+                env=process_env,
             )
 
             # Background thread: read stdout → queue
@@ -161,13 +156,26 @@ class ExtensionProcess:
 
             self._proc.kill()
             self._proc.wait()
+            self._cleanup_runtime()
             missing_module = self._extract_missing_module(msg)
             package_name = self._resolve_auto_repair_package(missing_module) if missing_module else None
-            if package_name and attempt < 2:
-                self._install_missing_package(python, missing_module, package_name)
+            if package_name and repair_python is not None and attempt < 2:
+                self._install_missing_package(repair_python, missing_module, package_name)
                 continue
 
             raise RuntimeError(f"[{self.MODEL_ID}] Expected 'ready', got: {msg}")
+
+    def _launch_spec(self) -> tuple[list[str], dict, Path | None]:
+        python = _venv_python(self.ext_dir)
+        if not python.exists():
+            raise RuntimeError(
+                f"[{self.MODEL_ID}] venv not found at {python}. "
+                "Run the extension's setup.py first."
+            )
+        return [str(python), str(_RUNNER_PATH)], self._build_env(), python
+
+    def _cleanup_runtime(self) -> None:
+        """Remove runtime resources left behind after the worker exits."""
 
     def _extract_missing_module(self, msg: dict) -> Optional[str]:
         """Returns missing import name from a runner error payload, if present."""
@@ -352,6 +360,7 @@ class ExtensionProcess:
                             if self._proc and self._proc.poll() is None:
                                 self._proc.kill()
                                 self._proc.wait(timeout=5.0)
+                                self._cleanup_runtime()
                         except Exception:
                             pass
                         self._loaded = False
@@ -379,7 +388,7 @@ class ExtensionProcess:
                     progress_cb(msg.get("pct", 0), msg.get("step", ""))
 
             elif t == "done":
-                return Path(msg["output_path"])
+                return self._host_path(Path(msg["output_path"]))
 
             elif t == "error":
                 # A failed generation can leave the worker without a model: a
@@ -432,6 +441,9 @@ class ExtensionProcess:
         })
         return self._receive_generation(req_id, progress_cb, cancel_event)
 
+    def _host_path(self, path: Path) -> Path:
+        return path
+
     def params_schema(self) -> list:
         return self._params_schema
 
@@ -450,6 +462,7 @@ class ExtensionProcess:
             try:
                 proc.kill()
                 proc.wait(timeout=5)
+                self._cleanup_runtime()
             except Exception as exc:
                 # Keep the process reference so callers can verify that the
                 # worker may still be alive and refuse to mutate its venv.
@@ -471,3 +484,112 @@ class ExtensionProcess:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
+
+
+class DockerExtensionProcess(ExtensionProcess):
+    """Runs the existing extension worker protocol inside its built image."""
+
+    def __init__(self, ext_dir: Path, manifest: dict, runtime: dict) -> None:
+        super().__init__(ext_dir, manifest)
+        self.runtime = runtime
+        self._container_name = f"modly-model-{ext_dir.name}-{uuid.uuid4().hex[:10]}"
+
+    @staticmethod
+    def _container_path(path: Path) -> Path:
+        from services.generator_registry import MODELS_DIR, WORKSPACE_DIR
+        resolved = path.resolve()
+        for host_root, container_root in (
+            (MODELS_DIR.resolve(), Path("/modly/models")),
+            (WORKSPACE_DIR.resolve(), Path("/modly/workspace")),
+        ):
+            try:
+                return container_root / resolved.relative_to(host_root)
+            except ValueError:
+                continue
+        return path
+
+    @staticmethod
+    def _translate_value(value):
+        if isinstance(value, dict):
+            return {key: DockerExtensionProcess._translate_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [DockerExtensionProcess._translate_value(item) for item in value]
+        if isinstance(value, str):
+            candidate = Path(value)
+            if candidate.is_absolute():
+                return str(DockerExtensionProcess._container_path(candidate))
+        return value
+
+    def _send(self, msg: dict) -> None:
+        super()._send(self._translate_value(msg))
+
+    def _host_path(self, path: Path) -> Path:
+        from services.generator_registry import MODELS_DIR, WORKSPACE_DIR
+        value = str(path)
+        for container_root, host_root in (
+            ("/modly/models", MODELS_DIR),
+            ("/modly/workspace", WORKSPACE_DIR),
+        ):
+            if value == container_root or value.startswith(container_root + "/"):
+                return host_root / Path(value).relative_to(container_root)
+        return path
+
+    def _launch_spec(self) -> tuple[list[str], dict, Path | None]:
+        from services.extension_runtime import container_api_url, docker_capabilities, docker_run_prefix
+        from services.generator_registry import MODELS_DIR, WORKSPACE_DIR, EXTENSIONS_DIR
+
+        image = self.runtime.get("image")
+        if not isinstance(image, str) or not image:
+            raise RuntimeError(f"[{self.MODEL_ID}] Docker image metadata is missing")
+        root = EXTENSIONS_DIR or self.ext_dir.parent
+        capabilities = docker_capabilities(root)
+        if not capabilities["dockerAvailable"]:
+            raise RuntimeError(capabilities["reason"] or "Docker is unavailable")
+
+        host_env = self._build_env()
+        container_env = {
+            "EXTENSION_DIR": "/opt/modly/extension",
+            "MODELS_DIR": "/modly/models",
+            "WORKSPACE_DIR": "/modly/workspace",
+            "MODLY_API_DIR": "/modly/api",
+            "MODLY_API_URL": container_api_url(),
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "MODEL_ID": host_env["MODEL_ID"],
+            "MODEL_NODE_ID": host_env["MODEL_NODE_ID"],
+            "SHARED_MODEL_DIRS": json.dumps({
+                key: str(self._container_path(Path(value)))
+                for key, value in json.loads(host_env["SHARED_MODEL_DIRS"]).items()
+            }),
+        }
+        if "MODEL_DIR" in host_env:
+            container_env["MODEL_DIR"] = str(self._container_path(Path(host_env["MODEL_DIR"])))
+        if os.environ.get("MODLY_SERVER_TOKEN"):
+            # Let Docker copy it from the CLI environment so the credential is
+            # not embedded in the visible process argument list.
+            container_env["MODLY_SERVER_TOKEN"] = None
+        for credential in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+            if os.environ.get(credential):
+                container_env[credential] = None
+        command = docker_run_prefix(
+            image,
+            name=self._container_name,
+            models_dir=MODELS_DIR,
+            workspace_dir=WORKSPACE_DIR,
+            api_dir=Path(__file__).parent.parent,
+            cache_dir=MODELS_DIR / ".modly-runtime-cache" / self.ext_dir.name,
+            nvidia=bool(self.runtime.get("nvidia") and capabilities["nvidiaToolkitAvailable"]),
+            environment=container_env,
+        )
+        return command, os.environ.copy(), None
+
+    def _cleanup_runtime(self) -> None:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", self._container_name],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass

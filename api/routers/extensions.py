@@ -11,15 +11,40 @@ import traceback
 import time
 import uuid
 from pathlib import Path
+import httpx
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from services.builtin_extensions import BUILTIN_MARKER
+from services.extension_runtime import (
+    container_api_url,
+    docker_capabilities,
+    docker_run_prefix,
+    extension_is_visible,
+    extension_runtime,
+    remove_extension_image,
+    runtime_settings,
+    set_docker_enabled,
+)
+from services.model_sources import (
+    normalize_model_sources,
+    normalize_weight_group_references,
+    normalize_weight_groups,
+    normalize_weight_variants,
+)
 
 router = APIRouter(tags=["extensions"])
 _install_tasks: set[asyncio.Task] = set()
 _install_logger = logging.getLogger("modly.extensions.install")
 _install_jobs: dict[str, dict[str, object]] = {}
+_active_process_runs: dict[str, tuple[str, subprocess.Popen, str | None]] = {}
 _INSTALL_JOB_TTL_SECONDS = 60 * 60
+_OFFICIAL_REGISTRY_URL = os.environ.get(
+    "MODLY_OFFICIAL_EXTENSION_REGISTRY",
+    "https://raw.githubusercontent.com/lightningpixel/modly-official-extension/main/registry.json",
+)
+_OFFICIAL_REGISTRY_TTL_SECONDS = 5 * 60
+_official_registry_cache: tuple[float, set[str]] | None = None
 
 _SAFE_EXTENSION_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -36,14 +61,56 @@ def _extension_path(extension_id: str) -> Path:
     if not _SAFE_EXTENSION_ID.fullmatch(extension_id):
         raise HTTPException(400, "Invalid extension id")
     root = _extension_root()
-    path = (root / extension_id).resolve()
+    # Keep the lexical destination. Developer-mode extensions are symlinks;
+    # resolving here would incorrectly reject them as escaping the extension
+    # root and could make uninstall target their source checkout.
+    path = root / extension_id
     if path.parent != root:
         raise HTTPException(400, "Invalid extension path")
     return path
 
 
-def _node_for_client(node: dict) -> dict:
-    variants = node.get("weight_variants")
+def _canonical_source(value: object) -> str:
+    return str(value).strip().lower().rstrip("/") if isinstance(value, str) else ""
+
+
+async def _trusted_repositories() -> set[str]:
+    global _official_registry_cache
+    now = time.monotonic()
+    if _official_registry_cache and now - _official_registry_cache[0] < _OFFICIAL_REGISTRY_TTL_SECONDS:
+        return _official_registry_cache[1]
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+            response = await client.get(
+                _OFFICIAL_REGISTRY_URL,
+                headers={"User-Agent": "Modly-Server"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        repositories = {
+            _canonical_source(item)
+            for item in payload.get("trusted_repos", [])
+            if _canonical_source(item)
+        } if isinstance(payload, dict) else set()
+        _official_registry_cache = (now, repositories)
+        return repositories
+    except Exception:
+        # An offline server should still list extensions. Preserve the last
+        # successful answer when possible, exactly as the desktop cache did.
+        if _official_registry_cache is None:
+            _official_registry_cache = (now, set())
+        return _official_registry_cache[1]
+
+
+def _node_for_client(
+    node: dict,
+    *,
+    manifest_params_schema: object,
+    manifest_param_defaults: object,
+    weight_groups: list[dict] | None,
+) -> dict:
+    params_schema = node.get("params_schema", manifest_params_schema)
+    variants = normalize_weight_variants(node, params_schema)
     if isinstance(variants, dict):
         variants = {
             "param": variants.get("param"),
@@ -66,62 +133,97 @@ def _node_for_client(node: dict) -> dict:
         "inputs": node.get("inputs"),
         "inputLabels": node.get("input_labels"),
         "output": node.get("output", "mesh"),
-        "paramsSchema": node.get("params_schema", []),
-        "paramDefaults": node.get("param_defaults"),
+        "paramsSchema": params_schema if isinstance(params_schema, list) else [],
+        "paramDefaults": {
+            **(manifest_param_defaults if isinstance(manifest_param_defaults, dict) else {}),
+            **(node.get("param_defaults") if isinstance(node.get("param_defaults"), dict) else {}),
+        },
         "hfRepo": node.get("hf_repo"),
         "downloadCheck": node.get("download_check"),
         "hfSkipPrefixes": node.get("hf_skip_prefixes"),
         "hfIncludePrefixes": node.get("hf_include_prefixes"),
-        "hasModelSources": isinstance(node.get("model_sources"), list),
-        "weightGroups": node.get("weight_groups"),
+        "hasModelSources": normalize_model_sources(node) is not None,
+        "weightGroups": normalize_weight_group_references(
+            node,
+            weight_groups,
+            field_name=f'nodes[{node.get("id", "")}].weight_groups',
+        ),
         "weightVariants": variants,
     }
 
 
-def _manifest_for_client(manifest: dict, *, corrupted: bool = False) -> dict:
+def _manifest_for_client(
+    manifest: dict,
+    *,
+    corrupted: bool = False,
+    runtime: str | None = None,
+    trusted_repos: set[str] | None = None,
+) -> dict:
+    weight_groups = normalize_weight_groups(manifest)
     nodes = [
-        _node_for_client(node)
+        _node_for_client(
+            node,
+            manifest_params_schema=manifest.get("params_schema", []),
+            manifest_param_defaults=manifest.get("param_defaults", {}),
+            weight_groups=weight_groups,
+        )
         for node in manifest.get("nodes", [])
         if isinstance(node, dict) and node.get("id")
     ]
     groups = []
-    for group in manifest.get("weight_groups", []) or []:
+    for group in weight_groups or []:
         if not isinstance(group, dict) or not group.get("id"):
             continue
         dependent = [
-            node["id"] for node in manifest.get("nodes", [])
-            if isinstance(node, dict) and group["id"] in (node.get("weight_groups") or [])
+            node["id"] for node in nodes
+            if node.get("weightGroups") and group["id"] in node["weightGroups"]
         ]
         groups.append({"id": group["id"], "dependentNodeIds": dependent})
     return {
         "type": manifest.get("type", "model"),
         "id": manifest.get("id", ""),
-        "name": manifest.get("name", manifest.get("id", "")),
+        "name": manifest.get("displayName", manifest.get("name", manifest.get("id", ""))),
         "version": manifest.get("version"),
         "description": manifest.get("description"),
-        "author": manifest.get("author"),
+        "author": (
+            manifest.get("author", {}).get("name")
+            if isinstance(manifest.get("author"), dict)
+            else manifest.get("author")
+        ),
         "source": manifest.get("source"),
         "entry": manifest.get("entry", ""),
-        "trusted": False,
+        "trusted": bool(manifest.get("builtin", False)) or _canonical_source(manifest.get("source")) in (trusted_repos or set()),
         "builtin": bool(manifest.get("builtin", False)),
         "nodes": nodes,
         "weightGroups": groups or None,
         "corrupted": corrupted,
+        "runtime": runtime,
     }
 
 
 @router.get("/list")
 async def list_extensions():
     result = []
-    for path in sorted(_extension_root().iterdir()):
+    root = _extension_root()
+    trusted_repos = await _trusted_repositories()
+    for path in sorted(root.iterdir()):
         if not path.is_dir() or path.name.startswith("."):
+            continue
+        if not extension_is_visible(root, path):
             continue
         manifest_path = path / "manifest.json"
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):
                 raise ValueError("manifest must be an object")
-            result.append(_manifest_for_client(manifest))
+            runtime_info = extension_runtime(path)
+            if isinstance(runtime_info.get("localSource"), str):
+                manifest = {**manifest, "source": f'local://{runtime_info["localSource"]}'}
+            result.append(_manifest_for_client(
+                manifest,
+                runtime=runtime_info.get("kind"),
+                trusted_repos=trusted_repos,
+            ))
         except Exception:
             result.append({
                 "type": "model", "id": path.name, "name": path.name,
@@ -132,14 +234,141 @@ async def list_extensions():
     return result
 
 
+class RuntimeSettings(BaseModel):
+    useDocker: bool
+
+
+@router.get("/runtime")
+async def get_runtime_settings():
+    return await asyncio.to_thread(docker_capabilities, _extension_root())
+
+
+@router.put("/runtime")
+async def update_runtime_settings(body: RuntimeSettings):
+    root = _extension_root()
+    if body.useDocker:
+        capabilities = await asyncio.to_thread(docker_capabilities, root)
+        if not capabilities["dockerAvailable"]:
+            raise HTTPException(409, capabilities["reason"] or "Docker is not available")
+    set_docker_enabled(root, body.useDocker)
+    await _stop_process_runs()
+    from services.generator_registry import generator_registry
+    await asyncio.to_thread(generator_registry.reload)
+    return await asyncio.to_thread(docker_capabilities, root)
+
+
 class GitHubInstall(BaseModel):
     url: str
+
+
+class LocalInstall(BaseModel):
+    path: str
 
 
 class ProcessRun(BaseModel):
     extension_id: str
     input: dict = Field(default_factory=dict)
     params: dict = Field(default_factory=dict)
+
+
+@router.post("/install-local")
+async def install_local(body: LocalInstall):
+    """Link a developer checkout through the desktop-managed local server.
+
+    Standalone/remote servers deliberately reject host paths; those clients
+    must use a fetchable URL or an upload flow instead of naming arbitrary
+    files on the server.
+    """
+    if os.environ.get("MODLY_DESKTOP_MANAGED") != "1":
+        raise HTTPException(403, "Local-folder linking is available only on the bundled server")
+    root = _extension_root()
+    if runtime_settings(root)["useDocker"]:
+        raise HTTPException(409, "Local-folder extensions are unavailable in Docker mode")
+    source = Path(body.path).expanduser().resolve()
+    if not source.is_dir():
+        raise HTTPException(400, "The selected local extension folder does not exist")
+
+    from services.extension_installer import _begin_registration, validate_manifest
+    from services.extension_runtime import write_extension_runtime
+    from services.generator_registry import generator_registry
+
+    manifest, _, _, _ = validate_manifest(source)
+    extension_id = manifest["id"]
+    destination = _extension_path(extension_id)
+    if destination == source:
+        raise HTTPException(400, "The local source folder is already the extension destination")
+    if (destination / BUILTIN_MARKER).is_file():
+        raise HTTPException(409, "Built-in extensions are managed by the server")
+    if destination.exists():
+        current, _, current_process, _ = validate_manifest(destination)
+        incoming_process = manifest.get("type") == "process"
+        if current["id"] != extension_id or current_process != incoming_process:
+            raise HTTPException(409, "The existing extension cannot be safely replaced")
+
+    backup = root / f".modly-backup-{extension_id}-{uuid.uuid4().hex}"
+    registration_state = None
+    had_previous = destination.exists() or destination.is_symlink()
+    await asyncio.to_thread(generator_registry.reload)
+    try:
+        if had_previous:
+            destination.rename(backup)
+        destination.symlink_to(source, target_is_directory=True)
+        write_extension_runtime(
+            destination,
+            {"kind": "system", "localSource": str(source)},
+        )
+        validation_capability, registration_state = _begin_registration(root, extension_id)
+        await asyncio.to_thread(generator_registry.reload, validation_capability)
+        relevant = {
+            key: value for key, value in generator_registry.load_errors().items()
+            if key == extension_id or key.startswith(f"{extension_id}/")
+        }
+        if relevant:
+            if had_previous:
+                destination.unlink(missing_ok=True)
+                backup.rename(destination)
+                await asyncio.to_thread(generator_registry.reload)
+                raise RuntimeError(
+                    "Local extension validation failed; the previous version was restored. "
+                    + "; ".join(relevant.values())
+                )
+            # A fresh developer checkout remains linked so Repair can create
+            # its environment, matching the previous local-development flow.
+            return {
+                "success": False,
+                "needsRepair": True,
+                "error": "The local extension is linked but needs Repair: " + "; ".join(relevant.values()),
+                "extensionId": extension_id,
+                "extension": _manifest_for_client(
+                    {**manifest, "source": f"local://{source}"},
+                    runtime="system",
+                ),
+                "localPath": str(source),
+            }
+        if backup.exists() or backup.is_symlink():
+            if backup.is_symlink():
+                backup.unlink()
+            else:
+                shutil.rmtree(backup)
+        return {
+            "success": True,
+            "extensionId": extension_id,
+            "extension": _manifest_for_client(
+                {**manifest, "source": f"local://{source}"},
+                runtime="system",
+            ),
+            "localPath": str(source),
+        }
+    except Exception as exc:
+        if destination.is_symlink():
+            destination.unlink(missing_ok=True)
+        if had_previous and (backup.exists() or backup.is_symlink()) and not destination.exists():
+            backup.rename(destination)
+        await asyncio.to_thread(generator_registry.reload)
+        raise HTTPException(500, str(exc)) from exc
+    finally:
+        if registration_state is not None:
+            registration_state.unlink(missing_ok=True)
 
 
 def _prune_install_jobs() -> None:
@@ -153,9 +382,34 @@ def _prune_install_jobs() -> None:
         _install_jobs.pop(install_id, None)
 
 
+async def _stop_process_runs(extension_id: str | None = None) -> None:
+    selected = [
+        (run_id, process, container_name)
+        for run_id, (owner, process, container_name) in list(_active_process_runs.items())
+        if extension_id is None or owner == extension_id
+    ]
+    for run_id, process, container_name in selected:
+        if process.poll() is None:
+            process.kill()
+        if container_name:
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [shutil.which("docker") or "docker", "rm", "-f", container_name],
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        _active_process_runs.pop(run_id, None)
+
+
 @router.post("/run-process")
 async def run_process(body: ProcessRun):
     extension_dir = _extension_path(body.extension_id)
+    if not extension_is_visible(_extension_root(), extension_dir):
+        raise HTTPException(404, "Extension is not installed for the selected runtime")
     manifest_path = extension_dir / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -166,6 +420,13 @@ async def run_process(body: ProcessRun):
     entry = manifest.get("entry")
     if not isinstance(entry, str) or not entry:
         raise HTTPException(400, "Process extension has no entry")
+    runtime = extension_runtime(extension_dir)
+    is_docker = runtime.get("kind") == "docker"
+    runtime_entry = runtime.get("entry", entry) if is_docker else entry
+    if not isinstance(runtime_entry, str) or not runtime_entry:
+        raise HTTPException(500, "Extension runtime entry metadata is incomplete")
+    if Path(runtime_entry).is_absolute() or ".." in Path(runtime_entry).parts:
+        raise HTTPException(400, "Process extension runtime entry is unsafe")
     entry_path = (extension_dir / entry).resolve()
     if extension_dir.resolve() not in entry_path.parents or not entry_path.is_file():
         raise HTTPException(400, "Process extension entry is missing or unsafe")
@@ -174,12 +435,37 @@ async def run_process(body: ProcessRun):
     workspace = registry.WORKSPACE_DIR
     temp_dir = workspace / "tmp"
     temp_dir.mkdir(parents=True, exist_ok=True)
+    def container_value(value):
+        if isinstance(value, dict):
+            return {key: container_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [container_value(item) for item in value]
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            return value
+        try:
+            path = Path(value).resolve()
+            for host_root, container_root in (
+                (workspace.resolve(), Path("/modly/workspace")),
+                (registry.MODELS_DIR.resolve(), Path("/modly/models")),
+            ):
+                try:
+                    return str(container_root / path.relative_to(host_root))
+                except ValueError:
+                    continue
+        except OSError:
+            pass
+        return value
+
+    run_input = container_value(body.input) if is_docker else body.input
+    run_params = container_value(body.params) if is_docker else body.params
+    runtime_workspace = "/modly/workspace" if is_docker else str(workspace)
+    runtime_temp = "/modly/workspace/tmp" if is_docker else str(temp_dir)
     payload = json.dumps({
-        "input": body.input,
-        "params": body.params,
+        "input": run_input,
+        "params": run_params,
         "nodeId": body.input.get("nodeId", ""),
-        "workspaceDir": str(workspace),
-        "tempDir": str(temp_dir),
+        "workspaceDir": runtime_workspace,
+        "tempDir": runtime_temp,
     }) + "\n"
     env = {
         **os.environ,
@@ -190,7 +476,41 @@ async def run_process(body: ProcessRun):
         "WORKSPACE_DIR": str(workspace),
         "TEMP_DIR": str(temp_dir),
     }
-    if entry_path.suffix == ".py":
+    container_name: str | None = None
+    if is_docker:
+        capabilities = await asyncio.to_thread(docker_capabilities, _extension_root())
+        if not capabilities["dockerAvailable"]:
+            raise HTTPException(503, capabilities["reason"] or "Docker is unavailable")
+        image = runtime.get("image")
+        if not isinstance(image, str) or not image:
+            raise HTTPException(500, "Extension Docker runtime metadata is incomplete")
+        container_name = f"modly-process-{body.extension_id}-{uuid.uuid4().hex[:10]}"
+        command = docker_run_prefix(
+            image,
+            name=container_name,
+            models_dir=registry.MODELS_DIR,
+            workspace_dir=workspace,
+            api_dir=Path(__file__).resolve().parents[1],
+            cache_dir=registry.MODELS_DIR / ".modly-runtime-cache" / body.extension_id,
+            nvidia=bool(runtime.get("nvidia") and capabilities["nvidiaToolkitAvailable"]),
+            environment={
+                "EXTENSION_DIR": "/opt/modly/extension",
+                "WORKSPACE_DIR": "/modly/workspace",
+                "TEMP_DIR": "/modly/workspace/tmp",
+                "MODLY_API_DIR": "/modly/api",
+                "MODLY_API_URL": container_api_url(),
+                **({"MODLY_SERVER_TOKEN": None}
+                   if os.environ.get("MODLY_SERVER_TOKEN") else {}),
+                **({"HF_TOKEN": None} if os.environ.get("HF_TOKEN") else {}),
+                **({"HUGGING_FACE_HUB_TOKEN": None}
+                   if os.environ.get("HUGGING_FACE_HUB_TOKEN") else {}),
+            },
+        )
+        if Path(runtime_entry).suffix == ".py":
+            command += ["/opt/modly/runtime-python", f"/opt/modly/extension/{runtime_entry}"]
+        else:
+            command += ["node", "/modly/api/process_runner.cjs", "/opt/modly/extension", runtime_entry]
+    elif entry_path.suffix == ".py":
         if sys.platform == "win32":
             venv_python = extension_dir / ".venv" / "Scripts" / "python.exe"
         else:
@@ -200,12 +520,30 @@ async def run_process(body: ProcessRun):
     else:
         node = os.environ.get("MODLY_NODE_EXECUTABLE", "node")
         command = [node, str(Path(__file__).resolve().parents[1] / "process_runner.cjs"), str(extension_dir), entry]
-    result = await asyncio.to_thread(
-        subprocess.run, command, input=payload, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", env=env, timeout=60 * 60,
+    run_id = uuid.uuid4().hex
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
     )
+    _active_process_runs[run_id] = (body.extension_id, process, container_name)
+    try:
+        stdout, stderr = await asyncio.to_thread(
+            process.communicate, payload, timeout=60 * 60
+        )
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        await asyncio.to_thread(process.communicate)
+        raise HTTPException(504, "Extension process timed out") from exc
+    finally:
+        _active_process_runs.pop(run_id, None)
     messages = []
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         try:
             messages.append(json.loads(line))
         except json.JSONDecodeError:
@@ -213,8 +551,25 @@ async def run_process(body: ProcessRun):
     done = next((message for message in reversed(messages) if message.get("type") == "done"), None)
     error = next((message for message in reversed(messages) if message.get("type") == "error"), None)
     if done is not None:
-        return {"success": True, "result": done.get("result") or {}}
-    message = error.get("message") if error else (result.stderr.strip() or f"Process exited with {result.returncode}")
+        output = done.get("result") or {}
+        def host_value(value):
+            if isinstance(value, dict):
+                return {key: host_value(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [host_value(item) for item in value]
+            if isinstance(value, str):
+                for container_root, host_root in (
+                    ("/modly/workspace", workspace),
+                    ("/modly/models", registry.MODELS_DIR),
+                ):
+                    if value == container_root or value.startswith(container_root + "/"):
+                        return str(host_root / Path(value).relative_to(container_root))
+            return value
+
+        if is_docker:
+            output = host_value(output)
+        return {"success": True, "result": output}
+    message = error.get("message") if error else (stderr.strip() or f"Process exited with {process.returncode}")
     raise HTTPException(500, message)
 
 
@@ -250,12 +605,17 @@ async def install_from_github(body: GitHubInstall):
         async def run() -> None:
             try:
                 result = await install_github(body.url, _extension_root(), emit)
+                trusted_repos = await _trusted_repositories()
                 # The done progress event is emitted by the installer. Send the
                 # full normalized extension as the terminal result.
                 await emit({
                     "step": "result",
                     **result,
-                    "extension": _manifest_for_client(result["manifest"]),
+                    "extension": _manifest_for_client(
+                        result["manifest"],
+                        runtime=extension_runtime(_extension_path(result["extensionId"])).get("kind"),
+                        trusted_repos=trusted_repos,
+                    ),
                 })
             except Exception as exc:
                 _install_logger.exception("Extension installation failed")
@@ -319,10 +679,17 @@ async def uninstall_extension(extension_id: str):
     from services.builtin_extensions import BUILTIN_MARKER
     if (path / BUILTIN_MARKER).is_file():
         raise HTTPException(403, "Built-in extensions are managed by the server")
-    if path.exists():
+    runtime = extension_runtime(path)
+    await _stop_process_runs(extension_id)
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
         shutil.rmtree(path)
     from services.generator_registry import generator_registry
-    await asyncio.to_thread(generator_registry.reload)
+    try:
+        await asyncio.to_thread(generator_registry.reload)
+    finally:
+        await asyncio.to_thread(remove_extension_image, runtime)
     return {"success": True}
 
 
@@ -333,6 +700,7 @@ async def reload_extensions(payload: dict | None = Body(default=None)):
     Unloads all currently loaded generators before reloading.
     """
     from services.generator_registry import generator_registry
+    await _stop_process_runs()
     validation_capability = None
     if isinstance(payload, dict):
         candidate = payload.get("validationCapability")
@@ -349,81 +717,72 @@ async def reload_extensions(payload: dict | None = Body(default=None)):
 
 @router.post("/setup/{ext_id}")
 async def setup_extension(ext_id: str):
-    """
-    Creates the isolated venv for an extension by running its setup.py.
-    Called automatically after installing an extension from GitHub.
-    Runs setup.py with Modly's embedded Python and the detected GPU SM.
-    """
-    from services.generator_registry import EXTENSIONS_DIR
-
-    if EXTENSIONS_DIR is None or not EXTENSIONS_DIR.exists():
-        raise HTTPException(400, "EXTENSIONS_DIR not configured")
-
-    ext_dir  = EXTENSIONS_DIR / ext_id
-    setup_py = ext_dir / "setup.py"
-
-    if not ext_dir.exists():
-        raise HTTPException(404, f"Extension '{ext_id}' not found in {EXTENSIONS_DIR}")
-    if not setup_py.exists():
-        # No setup.py → legacy extension, nothing to do
-        return {"status": "skipped", "reason": "no setup.py"}
-
-    # Detect GPU compute capability. NVIDIA keeps detection priority, exactly
-    # like electron/main/gpu-detect.ts: a Ryzen APU beside an NVIDIA dGPU must
-    # resolve to CUDA on both code paths.
-    gpu_sm, cuda_version = _detect_nvidia_gpu()
-    gfx_target           = "" if gpu_sm else _detect_gfx_target()
-    flavor               = "cuda" if gpu_sm else ("rocm" if gfx_target else "cpu")
-    torch_index_url      = _rocm_index_url() if flavor == "rocm" else ""
-    torch_specs          = ["torch", "torchvision"] if flavor == "rocm" else []
-
-    # Pass arguments as JSON so setup.py sees torch_flavor. The keys mirror
-    # runExtensionSetup in electron/main/ipc-handlers.ts exactly — setup.py
-    # scripts read the same contract whichever side launched them. Note this
-    # endpoint is a fallback: Electron normally runs setup.py itself, and only
-    # that path gets the ROCm index rewriting for extensions that ignore
-    # torch_flavor.
-    args = json.dumps({
-        "python_exe":      sys.executable,
-        "ext_dir":         str(ext_dir),
-        "gpu_sm":          gpu_sm,
-        "cuda_version":    cuda_version,
-        "accelerator":     flavor,
-        "torch_flavor":    flavor,
-        "gfx_target":      gfx_target,
-        "torch_index_url": torch_index_url,
-        "platform":        sys.platform,
-        "arch":            _node_arch(),
-    })
-
-    from services.extension_installer import extension_setup_environment
-
-    # Run setup.py using Modly's embedded Python (sys.executable)
-    loop   = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: subprocess.run(
-            [sys.executable, str(setup_py), args],
-            capture_output=True,
-            text=True,
-            # pip's own output carries box-drawing characters; the locale codec
-            # (cp1252 on Windows) raises on some of them and would turn a
-            # successful setup into a 500 with no usable message.
-            encoding="utf-8",
-            errors="replace",
-            env=extension_setup_environment(flavor, torch_index_url, torch_specs),
-        )
+    """Repair and validate an extension entirely on the selected server."""
+    from services.extension_installer import (
+        _begin_registration,
+        _setup_docker_extension,
+        _setup_extension,
+        validate_manifest,
     )
+    from services.generator_registry import generator_registry
 
-    if result.returncode != 0:
-        raise HTTPException(500, f"setup.py failed:\n{result.stderr}")
+    ext_dir = _extension_path(ext_id)
+    if not ext_dir.exists():
+        raise HTTPException(404, f"Extension '{ext_id}' is not installed")
+    manifest, entry, _, _ = validate_manifest(ext_dir)
+    previous_runtime = extension_runtime(ext_dir)
+    repaired_runtime = previous_runtime
+    registration_state = None
 
-    return {
-        "status":     "ok",
-        "gpu_sm":     gpu_sm,
-        "gfx_target": gfx_target,
-        "output":     result.stdout,
-    }
+    async def log_progress(event: dict) -> None:
+        message = event.get("message")
+        if isinstance(message, str) and message:
+            _install_logger.info("[%s repair] %s", ext_id, message)
+
+    # Stop any process/container using the extension before mutating its
+    # environment. reload() records broken extensions as load errors rather
+    # than failing the entire server.
+    await _stop_process_runs(ext_id)
+    await asyncio.to_thread(generator_registry.reload)
+    try:
+        if previous_runtime.get("kind") == "docker":
+            repaired_runtime = await _setup_docker_extension(
+                _extension_root(), ext_dir, manifest, entry, log_progress
+            )
+        else:
+            await _setup_extension(ext_dir, manifest, entry, log_progress)
+            repaired_runtime = {"kind": "system"}
+            from services.extension_runtime import write_extension_runtime
+            write_extension_runtime(ext_dir, repaired_runtime)
+
+        validation_capability, registration_state = _begin_registration(
+            _extension_root(), ext_id
+        )
+        await asyncio.to_thread(generator_registry.reload, validation_capability)
+        relevant = {
+            key: value for key, value in generator_registry.load_errors().items()
+            if key == ext_id or key.startswith(f"{ext_id}/")
+        }
+        if relevant:
+            raise RuntimeError(
+                "Extension runtime validation failed: " + "; ".join(relevant.values())
+            )
+    except Exception as exc:
+        if repaired_runtime.get("image") != previous_runtime.get("image"):
+            from services.extension_runtime import write_extension_runtime
+            write_extension_runtime(ext_dir, previous_runtime)
+            await asyncio.to_thread(remove_extension_image, repaired_runtime)
+        if registration_state is not None:
+            registration_state.unlink(missing_ok=True)
+        await asyncio.to_thread(generator_registry.reload)
+        detail = getattr(exc, "details", "") or str(exc)
+        raise HTTPException(500, detail) from exc
+
+    if registration_state is not None:
+        registration_state.unlink(missing_ok=True)
+    if repaired_runtime.get("image") != previous_runtime.get("image"):
+        await asyncio.to_thread(remove_extension_image, previous_runtime)
+    return {"status": "ok", "runtime": repaired_runtime}
 
 
 @router.get("/errors")

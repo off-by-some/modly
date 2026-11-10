@@ -376,6 +376,8 @@ async def cancel_managed_download(model_id: str):
 
 @router.delete("/storage/model/{model_id:path}")
 async def delete_model_storage(model_id: str):
+    if model_id in _managed_download_controls or model_id in _download_controls:
+        raise HTTPException(409, "Cannot remove model weights while their download is active")
     await unload_model(model_id)
     shutil.rmtree(_model_root(model_id), ignore_errors=True)
     return {"success": True}
@@ -383,6 +385,8 @@ async def delete_model_storage(model_id: str):
 
 @router.delete("/storage/{model_id:path}/variants/{variant_id}")
 async def delete_model_variant(model_id: str, variant_id: str):
+    if model_id in _managed_download_controls or model_id in _download_controls:
+        raise HTTPException(409, "Cannot remove a weight variant while its download is active")
     manifest = generator_registry.get_manifest(model_id)
     variants = manifest.get("weight_variants") or {}
     option = next((item for item in variants.get("options", []) if item.get("id") == variant_id), None)
@@ -405,6 +409,11 @@ async def delete_model_variant(model_id: str, variant_id: str):
 async def delete_extension_storage(extension_id: str):
     if not _SAFE_MODEL_PART.fullmatch(extension_id):
         raise HTTPException(400, "Invalid extension id")
+    if any(
+        model_id.startswith(f"{extension_id}/")
+        for model_id in {*_managed_download_controls, *_download_controls}
+    ):
+        raise HTTPException(409, "Cannot remove extension weights while a download is active")
     model_ids = [model_id for model_id in generator_registry._generators if model_id.startswith(f"{extension_id}/")]
     for model_id in model_ids:
         await unload_model(model_id)
@@ -420,6 +429,11 @@ async def delete_shared_group_storage(extension_id: str, group_id: str):
     state = next((item for item in states if item["id"] == group_id), None)
     if state is None:
         raise HTTPException(404, "Unknown shared weight group")
+    if any(
+        model_id in _managed_download_controls or model_id in _download_controls
+        for model_id in state["dependentModelIds"]
+    ):
+        raise HTTPException(409, "Cannot remove shared weights while a dependent download is active")
     for model_id in state["dependentModelIds"]:
         await unload_model(model_id)
     shutil.rmtree(registry_module.MODELS_DIR / extension_id / "_shared" / group_id, ignore_errors=True)

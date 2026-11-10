@@ -5,6 +5,7 @@ import { existsSync, mkdirSync } from 'fs'
 import axios from 'axios'
 import { ensureAgentDir, getSettings } from './settings-store'
 import { getHfToken } from './hf-token'
+import { getBuiltinExtensionsDir } from './builtin-sync'
 import { logger } from './logger'
 import { cleanPythonEnv, getVenvPythonExe } from './python-setup'
 import { LOCAL_API_URL } from './backend-target'
@@ -57,10 +58,11 @@ export class PythonBridge {
         // mesh_ops uses Electron in Node mode for the existing meshoptimizer
         // backend, so packaged builds do not depend on a system Node install.
         MODLY_NODE_EXECUTABLE:  process.execPath,
-        // The desktop owns a separate builtin-extensions directory. A
-        // standalone remote API has no desktop owner and bootstraps them into
-        // EXTENSIONS_DIR itself.
+        // The selected API owns extension discovery. Give the bundled server
+        // the desktop's compiled built-ins so it can bootstrap the same
+        // server-owned copies as a standalone remote API.
         MODLY_DESKTOP_MANAGED:  '1',
+        MODLY_BUILTIN_EXTENSIONS_DIR: getBuiltinExtensionsDir(),
         // We decode both pipes as UTF-8 below (Buffer.toString() default), and
         // the API forwards extension output — tqdm bars included — through its
         // own stderr. Without this the API would encode them with the Windows

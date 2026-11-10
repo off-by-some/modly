@@ -24,7 +24,8 @@ from types import ModuleType
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from services.generators.base import BaseGenerator
-from services.extension_process import ExtensionProcess, _venv_python
+from services.extension_process import DockerExtensionProcess, ExtensionProcess, _venv_python
+from services.extension_runtime import extension_is_visible, extension_runtime
 from services.model_sources import (
     missing_weight_variant,
     model_sources_are_downloaded,
@@ -418,6 +419,8 @@ def _discover_extensions(
         # Dot-dirs are install machinery (staging/backup), never extensions
         if ext_dir.name.startswith("."):
             continue
+        if not extension_is_visible(EXTENSIONS_DIR, ext_dir):
+            continue
         manifest_path  = ext_dir / "manifest.json"
         generator_path = ext_dir / "generator.py"
 
@@ -439,6 +442,7 @@ def _discover_extensions(
             print(f"[Registry] ERROR: {message}")
             _record_discovery_error(errors, message, fallback_id=ext_dir.name)
             continue
+        runtime = extension_runtime(ext_dir)
 
         try:
             # Process extensions run via Electron's process runner, not this
@@ -577,7 +581,8 @@ def _discover_extensions(
             has_build_vendor = (ext_dir / "build_vendor.py").exists()
             vendor_built     = (ext_dir / "vendor").exists()
             needs_setup      = (has_setup and not has_venv) or (has_build_vendor and not vendor_built)
-            subprocess_mode  = has_venv or needs_setup
+            docker_mode      = runtime.get("kind") == "docker"
+            subprocess_mode  = docker_mode or has_venv or needs_setup
 
             cls_or_None = None
             legacy_context = None
@@ -622,6 +627,7 @@ def _discover_extensions(
                         "inputs":           node.get("inputs"),
                         "output":           node.get("output", "mesh"),
                         "weight_groups":    [group_by_id[group_id] for group_id in group_ids],
+                        "_runtime":         runtime,
                     }
                     if model_sources is not None:
                         node_manifest["model_sources"] = model_sources
@@ -630,7 +636,9 @@ def _discover_extensions(
                     full_id = f"{ext_id}/{node['id']}"
                     result[full_id] = (cls_or_None, node_manifest, ext_dir, legacy_context)
                     if subprocess_mode:
-                        if has_venv:
+                        if docker_mode:
+                            print(f"[Registry] Loaded Docker node: {full_id}")
+                        elif has_venv:
                             print(f"[Registry] Loaded subprocess node: {full_id}")
                         else:
                             print(f"[Registry] Node '{full_id}' needs setup (venv missing)")
@@ -638,9 +646,12 @@ def _discover_extensions(
                         print(f"[Registry] Loaded node: {full_id} ({class_name})")
             else:
                 # No nodes defined — register by ext_id as fallback
-                result[ext_id] = (cls_or_None, manifest, ext_dir, legacy_context)
+                fallback_manifest = {**manifest, "_runtime": runtime}
+                result[ext_id] = (cls_or_None, fallback_manifest, ext_dir, legacy_context)
                 if subprocess_mode:
-                    if has_venv:
+                    if docker_mode:
+                        print(f"[Registry] Loaded Docker extension: {ext_id}")
+                    elif has_venv:
                         print(f"[Registry] Loaded subprocess extension: {ext_id}")
                     else:
                         print(f"[Registry] Extension '{ext_id}' needs setup (venv missing)")
@@ -692,14 +703,21 @@ class GeneratorRegistry:
             cls, manifest, ext_dir, legacy_context = entry
             try:
                 if cls is None:
-                    # Subprocess mode: venv must exist
-                    if not _venv_python(ext_dir).is_file():
+                    runtime = manifest.get("_runtime", {})
+                    docker_mode = isinstance(runtime, dict) and runtime.get("kind") == "docker"
+                    # System subprocess mode requires a host venv. Docker
+                    # extensions carry their runtime in the built image.
+                    if not docker_mode and not _venv_python(ext_dir).is_file():
                         raise RuntimeError(
                             "venv not found — extension needs setup. "
                             "Click 'Repair' on the Models page to run setup.py."
                         )
                     # Subprocess mode: wrap in ExtensionProcess
-                    gen = ExtensionProcess(ext_dir, manifest)
+                    gen = (
+                        DockerExtensionProcess(ext_dir, manifest, runtime)
+                        if docker_mode
+                        else ExtensionProcess(ext_dir, manifest)
+                    )
                     # Pin the subprocess envelope to the exact registry key;
                     # multi-node workers must never fall back to an extension ID.
                     gen.MODEL_ID    = model_id
