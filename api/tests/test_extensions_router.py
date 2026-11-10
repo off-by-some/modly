@@ -25,6 +25,7 @@ from services.builtin_extensions import BUILTIN_MARKER, sync_builtin_extensions
 from services.extension_installer import (
     InstallCommandError,
     _run_command,
+    _setup_docker_extension,
     extension_setup_environment,
     extract_archive,
     install_github,
@@ -301,6 +302,47 @@ class ServerExtensionInstallerTests(unittest.TestCase):
         self.assertIn("Traceback (most recent call last):", raised.exception.details)
         self.assertIn("RuntimeError: setup exploded", raised.exception.details)
         self.assertTrue(any(event.get("message") == "installing dependency" for event in events))
+
+    def test_docker_cleanup_does_not_mask_the_setup_failure(self) -> None:
+        async def progress(_event: dict) -> None:
+            return None
+
+        async def fake_run_command(*_args, **_kwargs) -> None:
+            fake_run_command.calls += 1
+            if fake_run_command.calls == 2:
+                raise InstallCommandError("original setup failure", "dependency traceback")
+
+        fake_run_command.calls = 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            extension = root / "pixal3d"
+            extension.mkdir()
+            (extension / "setup.py").write_text("pass\n", encoding="utf-8")
+            manifest = {"id": "pixal3d", "nodes": [{"id": "generate"}]}
+
+            with (
+                patch("services.extension_installer.docker_capabilities", return_value={
+                    "dockerAvailable": True,
+                    "nvidiaContainerMode": "",
+                    "reason": "",
+                }),
+                patch("routers.extensions._detect_nvidia_gpu", return_value=("", 0)),
+                patch("services.extension_installer._run_command", new=fake_run_command),
+                patch("services.extension_installer.remove_extension_image"),
+                patch("services.extension_installer.subprocess.run", side_effect=OSError("cleanup failed")),
+            ):
+                with self.assertRaises(InstallCommandError) as raised:
+                    asyncio.run(_setup_docker_extension(
+                        root,
+                        extension,
+                        manifest,
+                        "generator.py",
+                        progress,
+                    ))
+
+        self.assertEqual(str(raised.exception), "original setup failure")
+        self.assertEqual(raised.exception.details, "dependency traceback")
 
     def test_only_canonical_github_repository_urls_are_accepted(self) -> None:
         self.assertEqual(
