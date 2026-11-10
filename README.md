@@ -2,11 +2,22 @@
   <img src="resources/icons/icon.png" width="96" alt="Modly logo" />
 </p>
 
-# Modly
+# Modly Relay
 
-**Local, open source, AI-powered image-to-3D mesh generation.**
-Turn any photo into a 3D model using open source AI models running entirely on your GPU.
-Modly is a desktop application for Windows, Linux, and Apple Silicon macOS.
+**A server-first Modly fork for remote GPU machines and containerized extensions.**
+
+The original Modly desktop mixed UI responsibilities with backend filesystem,
+download, extension, and execution concerns. This fork moves those operations
+behind the Modly API, making the server authoritative whether the UI uses its
+bundled local server or connects to a remote GPU machine.
+
+Extensions installed from a URL can also be built and run in isolated Docker
+containers, with NVIDIA Docker runtime and CDI GPU support. In short: keep the UI
+on your desktop, run the heavy work wherever the GPU lives, and isolate custom
+extension environments from one another.
+
+Modly turns photos into 3D models using open source AI models and runs on Windows,
+Linux, and Apple Silicon macOS.
 
 > Created by [Lightning Pixel](https://github.com/lightningpixel)
 
@@ -30,6 +41,30 @@ launch.bat
 # Linux / macOS
 ./launch.sh
 ```
+
+---
+
+## What this fork adds
+
+This fork separates the desktop UI from backend execution and adds:
+
+- configurable bundled-local and remote API servers, allowing the UI to drive a
+  separate GPU machine;
+- server-authoritative models, downloads, extensions, workflows, workspace data,
+  logs, RAM reporting, and process execution;
+- optional bearer-token authentication;
+- server-side extension cloning, setup, validation, repair, and uninstall;
+- live extension installation output, retained tracebacks, SSE keep-alives, and
+  recoverable server install jobs when the progress connection drops;
+- server-owned built-in extension bootstrap;
+- optional Docker isolation for URL-installed extensions, including inferred
+  Python versions and NVIDIA runtime/CDI GPU support;
+- configurable upload and extension archive limits, unlimited by default;
+- remote health monitoring, outage notification, and automatic fallback to the
+  bundled server without changing or deleting either server's data;
+- workflow state fixes that preserve nodes when images or new nodes are added; and
+- a macOS package-and-install command that replaces the app bundle while preserving
+  user data.
 
 ---
 
@@ -59,13 +94,161 @@ pip install -r requirements.txt
 npm run dev
 ```
 
+> On Apple Silicon macOS, `npm run package-and-install` builds the current tree and
+> replaces `/Applications/Modly.app` while preserving settings, models, extensions,
+> workflows, workspace files, and other user data. Use `npm run package:mac` when
+> you only need the packaged artifact.
+
 ### 4. Test
 
 ```bash
 npm test
-./node_modules/.bin/tsc --noEmit -p tsconfig.node.json
+npm run lint
 npm run build
 ```
+
+---
+
+## Backend servers and data ownership
+
+Choose the active server under **Settings → Backend**.
+
+| Mode | API endpoint | Data owner | Compute owner |
+|---|---|---|---|
+| Bundled server | `http://127.0.0.1:8765` | The desktop-configured local models, extensions, workflows, workspace, agent, and log directories | The desktop machine |
+| Remote server | The configured HTTP(S) URL | Directories configured on the remote server | The remote server |
+
+Switching servers changes which catalog and data are displayed; it does not copy,
+move, or delete data. Returning to the bundled server restores the same local
+directories used before remote support was enabled. When a saved remote server is
+unavailable during startup, Modly starts the bundled server before loading the UI
+and notifies the user. During a later outage it retries, prompts the user, and can
+automatically swap to the bundled server after repeated failures.
+
+Remote paths are server paths. Files that exist only on the desktop, such as an
+image selected from a native file dialog or an imported GGUF model, are uploaded
+to the selected server. Fetchable resources such as GitHub extension repositories
+and Hugging Face model files are downloaded directly by that server.
+
+### Run Modly on a remote server
+
+One of this fork's main features is keeping the desktop UI on one machine while
+models, extensions, workflows, downloads, and generation run on a remote GPU
+server. On the remote machine, clone this repository and run the following from
+its root. The example uses `python3`; set `PYTHON_BIN` if the interpreter has a
+different name or path.
+
+```bash
+MODLY_SERVER_DATA="${MODLY_SERVER_DATA:-$(pwd)/server-data}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+MODLY_API_PORT="${MODLY_API_PORT:-8765}"
+
+"$PYTHON_BIN" -m venv api/.venv
+api/.venv/bin/python -m pip install --upgrade pip
+api/.venv/bin/python -m pip install -r api/requirements.txt
+
+mkdir -p \
+  "$MODLY_SERVER_DATA/models" \
+  "$MODLY_SERVER_DATA/workspace" \
+  "$MODLY_SERVER_DATA/workflows" \
+  "$MODLY_SERVER_DATA/extensions" \
+  "$MODLY_SERVER_DATA/llm" \
+  "$MODLY_SERVER_DATA/logs"
+
+(
+  cd api
+  env \
+    MODELS_DIR="$MODLY_SERVER_DATA/models" \
+    WORKSPACE_DIR="$MODLY_SERVER_DATA/workspace" \
+    WORKFLOWS_DIR="$MODLY_SERVER_DATA/workflows" \
+    EXTENSIONS_DIR="$MODLY_SERVER_DATA/extensions" \
+    MODLY_LLM_DIR="$MODLY_SERVER_DATA/llm" \
+    MODLY_LOG_DIR="$MODLY_SERVER_DATA/logs" \
+    MODLY_API_PORT="$MODLY_API_PORT" \
+    ./.venv/bin/python -m uvicorn main:app \
+      --host 0.0.0.0 \
+      --port "$MODLY_API_PORT"
+)
+```
+
+The server binds every interface in this example. Set a token before starting it
+whenever untrusted clients can reach the port:
+
+```bash
+export MODLY_SERVER_TOKEN="replace-with-a-long-random-token"
+```
+
+`MODLY_SERVER_TOKEN` is optional. When set, every API request must use it as a
+bearer token; enter the same value in **Settings → Backend**. When unset, the
+server accepts unauthenticated requests. Prefer HTTPS when a token crosses a
+network; the UI requires explicit consent before sending credentials over plain
+remote HTTP. In the desktop, select **Remote**, enter
+`http://<server-address>:8765` (or your HTTPS reverse-proxy URL), and click
+**Test & connect**.
+
+### Server environment variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `MODELS_DIR` | Downloaded model weights and extension runtime caches | `~/.modly/models` |
+| `WORKSPACE_DIR` | Generated assets, exports, workflow inputs, and temporary files | `~/.modly/workspace` |
+| `WORKFLOWS_DIR` | Saved workflow JSON documents | Sibling `workflows` directory, or `~/.modly/workflows` |
+| `EXTENSIONS_DIR` | Server-owned built-in and user-installed extensions | Must be set for extension management |
+| `MODLY_LLM_DIR` | Local agent engine, GGUF models, configuration, and related state | `~/.modly/llm` |
+| `MODLY_LOG_DIR` | Rotating `server.log` location | Sibling `logs` directory, or `~/.modly/logs` |
+| `MODLY_SERVER_TOKEN` | Optional bearer token required by every non-`OPTIONS` request | Authentication disabled |
+| `MODLY_ALLOWED_ORIGINS` | Comma-separated CORS origins | Desktop/file and local development origins |
+| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | Optional Hugging Face credential inherited by downloads and extension runtimes | Unset |
+| `MODLY_API_PORT` | API port advertised to Docker extension containers | `8765` |
+| `MODLY_CONTAINER_API_URL` | Explicit API URL used from inside extension containers | Derived from platform and `MODLY_API_PORT` |
+| `MODLY_EXTENSION_SETUP_TIMEOUT` | Maximum extension setup time in seconds | `1800` |
+| `MODLY_EXTENSION_PYPI_INDEX_URL` | PyPI fallback added to CUDA extension setup when no extra index is already configured | `https://pypi.org/simple` |
+| `MODLY_MAX_UPLOAD_BYTES` | Fallback limit for client-originated uploads | Unlimited |
+| `MODLY_MAX_IMAGE_UPLOAD_BYTES` | Image upload override | `MODLY_MAX_UPLOAD_BYTES` |
+| `MODLY_MAX_ASSET_UPLOAD_BYTES` | Desktop asset staging override | `MODLY_MAX_UPLOAD_BYTES` |
+| `MODLY_MAX_GGUF_UPLOAD_BYTES` | GGUF upload override | `MODLY_MAX_UPLOAD_BYTES` |
+| `MODLY_MAX_EXTENSION_ARCHIVE_BYTES` | Compressed GitHub extension archive limit | Unlimited |
+| `MODLY_MAX_EXTENSION_EXTRACTED_BYTES` | Extracted extension size limit | Unlimited |
+| `MODLY_MAX_EXTENSION_ARCHIVE_MEMBERS` | Extension archive member-count limit | Unlimited |
+
+For byte/count limits, unset, `0`, `none`, and `unlimited` all mean unlimited.
+
+### Docker extension runtime
+
+Enable **Use Docker** under **Settings → Backend → Extension runtime**. Capability
+detection runs on the selected server, so a remote connection inspects remote Docker
+rather than the desktop installation.
+
+- Built-in extensions remain visible in either mode.
+- Custom extensions installed without Docker are hidden, not deleted, while Docker
+  mode is selected. Reinstall their GitHub URL to create a containerized copy.
+- URL-installed Docker extensions are built and invoked on the server. Modly infers
+  Python from the extension manifest, wheelhouse metadata, or standard Python package
+  metadata, then falls back to the server Python version.
+- Containers receive controlled model, workspace, API, and persistent cache mounts.
+  On Linux they run with the server user's UID/GID so generated files do not become
+  root-owned.
+- NVIDIA GPU access supports both the registered NVIDIA Docker runtime (`--gpus all`)
+  and Docker CDI (`--device nvidia.com/gpu=all`). Settings distinguishes a missing
+  toolkit from a toolkit that is installed but not configured for the Docker daemon.
+
+To configure NVIDIA Container Toolkit with Docker's NVIDIA runtime:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+Useful diagnostics are:
+
+```bash
+docker info --format '{{json .Runtimes}}'
+nvidia-ctk --version
+nvidia-ctk cdi list
+docker info --format '{{json .CDISpecDirs}}'
+```
+
+---
 
 ## Platform notes
 
@@ -74,9 +257,8 @@ npm run build
   required. See [docs/running-on-amd-rocm.md](docs/running-on-amd-rocm.md).
 - macOS support targets Apple Silicon only.
 - macOS uses native window controls. Windows and Linux keep the existing custom controls.
-- The top bar includes a live RAM indicator sourced from the main process.
+- The top bar includes a live RAM indicator sourced from the selected server.
 - Workflow wiring is validated before run; invalid graphs stay in place and surface inline/toast warnings instead of dropping the current mesh view.
-- Package Apple Silicon macOS with `npm run package:mac`.
 - Imported meshes can be smoothed and decimated in-app; optimized results are written back into the workspace.
 
 ---
@@ -84,6 +266,24 @@ npm run build
 ## Extension system
 
 Modly supports external model and process extensions. Each extension is a GitHub repository containing a `manifest.json` plus the runtime entry files required by its type.
+
+The selected server owns extension discovery and lifecycle operations. Installing
+from a GitHub URL sends the URL to that server; the server downloads and validates
+the repository, prepares its system or Docker runtime, registers it atomically, and
+then refreshes the catalog. The desktop does not clone a remote server's extension
+locally.
+
+Installation output streams back to the Models page and is also written to the
+server log. The UI retains recent output and the full traceback when setup fails.
+Long-running installs have a server job ID: if the SSE connection drops during a
+large dependency download, the install continues and the client recovers progress
+from the server instead of reporting a false terminal failure. Interrupted server
+transactions are recovered or rolled back during startup, and **Repair** reruns setup
+and runtime validation on the selected server.
+
+Built-in workflow extensions are bootstrapped by both bundled and standalone
+servers. Local-folder linking remains a bundled-server developer feature because a
+remote client must not name arbitrary host paths on the server.
 
 ### Official extensions
 
